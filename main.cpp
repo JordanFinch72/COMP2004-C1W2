@@ -1,19 +1,12 @@
 #include "mbed.h"
 #include "uop_msb_2_0_0.h"
 #include <iostream>
-#include <string>
 #include "BMP280_SPI.h"
 #include "SDBlockDevice.h"
 #include "FATFileSystem.h"
 
 using namespace uop_msb_200;
 using namespace std;
-
-// Global defines (to save precious space)
-#define BUFFER_SIZE 1024
-#define CONSUME_THRESHOLD 768
-#define POT_TOLERANCE 3000
-#define POT_HALFWAY 32767
 
 // C Function Prototypes
 extern int write_sdcard();
@@ -32,20 +25,17 @@ AnalogIn ldr(AN_LDR_PIN);
 LatchedLED ledStrip(LatchedLED::STRIP);
 LatchedLED ledDigit(LatchedLED::SEVEN_SEG);
 
+<<<<<<< HEAD
 // Switches // TODO: This seems to be an alternative to btns; delete after if not used
 DigitalIn btnA(PG_0);
 
+=======
+>>>>>>> parent of d302256 (Experimental set datetime code)
 //Buzzer
 Buzzer buzz;
 
-// Potentiometer
-AnalogIn pot(PA_0);
-
 //LCD Display
 LCD_16X2_DISPLAY lcd_disp;
-
-// Ticker
-Ticker ticker;
 
 // Functions //
 void debugStuff();
@@ -63,63 +53,7 @@ int read_sd();
 Thread tSample, tSDWrite, tSerialComm, tNetComm;
 Thread tDebug;
 
-// Classes & Structs //
-class FIFO_Buffer
-{
-    // TODO: Use C++ templates for higher marks
-    // TODO: Full buffer = critical error event, "reported" (presumably he means logged, as well)
-    // TODO: Use RTOS APIs to make it thread-safe
-    // TODO: FIFO read should be blocking
-    // TODO: All thread synchronization should be handled by the class member functions
-
-    public:
-        char buffer[BUFFER_SIZE]; // TODO: Determine size of buffer; determine if "string" is the best data type, here. Might be oversized
-    private:
-        int itemCount = 0, freeSpace = BUFFER_SIZE;
-
-    Thread tProducer, tConsumer;
-
-    public:
-        void produce(string message)
-        {
-            // I don't think this is the way to do this atm; I'm just laying the groundwork of the logic or whatever
-            // If there isn't enough space
-            if(freeSpace < message.size())
-            {
-                // Sleep the producer AND trigger the consumer
-                // The consumer will have woken the producer - add the message to the buffer
-                //  - What happens if another produce() call is made while we're waiting for consumer() to finish? Consumer is blocking, so that will pause any more producer() calls?
-                //  - Or will the data from other producer() calls somehow be preserved on the stack/heap until consumer unblocks?
-            }
-            else
-            {
-                // Write to the buffer, decrement freeSpace with the size of the message (?)
-
-                // Also, call to consume if threshold reached
-                if(itemCount >= CONSUME_THRESHOLD)
-                {
-                    consume(); // TODO: Obviously not just this; set on own thread and block etc.
-                }
-            }
-        }
-
-    // Consume the entire buffer (used for writing blocks to the SD card)
-    // The "read" operation (should be blocking)
-    void consume()
-    {        
-        if(tSDWrite.start(write_sd) == 0)
-        {
-            freeSpace = 1024;
-            itemCount = 0;
-            memset(buffer, 0, 1024); // Clear the buffer... hopefully
-        }
-
-        // Could also consider returning the address of the buffer and having it empty itself upon some sort of callback from sd_write()
-        //  - Perhaps call sd_write() in here
-    }
-};
-FIFO_Buffer fifoBuffer;
-
+// Structs //
 struct SensorData
 {
     // TODO: Data types probably incorrect
@@ -129,24 +63,18 @@ struct SensorData
 };
 SensorData sensorData;
 
-
-
 BMP280_SPI bmp280(PB_5, PB_4, PB_3, PB_2);
 
 // SD Card
 static SDBlockDevice sd_mine(PB_5, PB_4, PB_3, PF_3); // SD Card Block Device
 static InterruptIn sd_inserted(PF_4); // Interrupt for card insertion events
 
-// Globals
-int dt_part = 0; // Date/Time Set Part [0: wait, 1: day, 2: month, 3: year, 4: hour, 5: minute, 6: second]. Not enum because can't ++dt_part if enum
-unsigned short pot_old = 0; // Previous value of potentiometer
-int day = 1, month = 1, year = 1970, hour = 0, minute = 0, second = 0; // Datetime data (no need to use a heavy class/struct here unless spec requires it)
-
 /* Requirements *
  - Active: 1, 2, 3, 4, 8, 9, 12, 13
  - Passive: 5, 6, 7, 10, 11
 */
 
+<<<<<<< HEAD
 void change_part()
 {
     dt_part = (dt_part == 6) ? 0 : dt_part + 1; // Increment until 6, then wrap to 0
@@ -156,6 +84,8 @@ void display_datetime()
     ++second;
 }
 
+=======
+>>>>>>> parent of d302256 (Experimental set datetime code)
 // Remember that main() runs in its own thread in the OS
 int main()
 {
@@ -181,6 +111,7 @@ int main()
     read_sd();
 
     /* END Requirement 2 - SD Card Writing */
+<<<<<<< HEAD
 
     /* START Requirement 4 - Set Date/Time */
     
@@ -336,61 +267,66 @@ int main()
     }
 
     /* END Requirement 4 - Set Date/Time */
+=======
+>>>>>>> parent of d302256 (Experimental set datetime code)
 }
 
-int write_sd() 
-{
-    // Call the SDBlockDevice instance initialisation method
-    if (sd_mine.init() != 0) 
-        return -1;
+int write_sd() {
+  printf("Initialise and write to a file\n");
 
-    FATFileSystem fs("sd", &sd_mine);
-    FILE *fp = fopen("/sd/sensor_data.txt", "w");
+  // call the SDBlockDevice instance initialisation method.
+  if (0 != sd_mine.init()) {
+    printf("Init failed \n");
+    return -1;
+  }
 
-    if (fp == NULL)
-    {
-        // File could not be opened for write
-        sd_mine.deinit();
-        return -1;
-    } 
-    else 
-    {        
-        fprintf(fp, "%s", fifoBuffer.buffer);
-        fclose(fp);
-        return sd_mine.deinit(); // Returns 0
-    }  
+  FATFileSystem fs("sd", &sd_mine);
+  FILE *fp = fopen("/sd/test.txt", "w+");
+  if (fp == NULL) {
+    error("Could not open file for write\n");
+    sd_mine.deinit();
+    return -1;
+  } else {
+    // Put some text in the file...
+    fprintf(fp, "Jordan says, \"Hi!\"\n");
+    // Tidy up here
+    fclose(fp);
+    printf("SD Write done...\n");
+    sd_mine.deinit();
+    return 0;
+  }  
 }
 
 int read_sd()
 {
-    // Call the SDBlockDevice instance initialisation method
-    if (sd_mine.init() != 0) 
-        return -1;
+    printf("Initialise and read from a file\n");
 
-    FATFileSystem fs("sd", &sd_mine);
-    FILE *fp = fopen("/sd/sensor_data.txt", "r");
-    if (fp == NULL) 
-    {
-        error("Could not open or find file for read\n");
-        sd_mine.deinit();
-        return -1;
+  // call the SDBlockDevice instance initialisation method.
+  if (0 != sd_mine.init()) {
+    printf("Init failed \n");
+    return -1;
+  }
+
+  FATFileSystem fs("sd", &sd_mine);
+  FILE *fp = fopen("/sd/test.txt", "r");
+  if (fp == NULL) {
+    error("Could not open or find file for read\n");
+    sd_mine.deinit();
+    return -1;
+  } else {
+    // Put some text in the file...
+    char buff[64];
+    buff[63] = 0;
+    while (!feof(fp)) {
+      fgets(buff, 63, fp);
+      printf("%s\n", buff);
     }
-    else 
-    {
-        // Read the file
-        /*
-        char buff[64];
-        buff[63] = 0;
-        while (!feof(fp)) 
-        {
-            fgets(buff, 63, fp);
-            printf("%s\n", buff);
-        }
-        // Tidy up here
-        */
-        fclose(fp);
-        return sd_mine.deinit();
-    }
+    // Tidy up here
+    fclose(fp);
+    printf("SD Write done...\n");
+    sd_mine.deinit();
+    return 0;
+  }
 }
 
 void debugStuff()
@@ -408,10 +344,6 @@ void sampleEnvironment()
         sensorData.light_level = ldr;
         sensorData.temperature = bmp280.getTemperature();
         sensorData.pressure = bmp280.getPressure();
-
-        // TODO: send data to FIFO buffer (on this thread(?))
-        string message = "Temperature: "+to_string(sensorData.temperature)+" || Pressure: "+to_string(sensorData.pressure)+" || Light: "+to_string(sensorData.light_level)+"\n";
-        fifoBuffer.produce(message);
 
         // Wait a second (minus however long it took? Timer would probably cause overhead, though)
         ThisThread::sleep_for(1000ms);
