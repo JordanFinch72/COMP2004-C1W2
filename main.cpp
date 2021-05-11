@@ -25,12 +25,6 @@ AnalogIn ldr(AN_LDR_PIN);
 LatchedLED ledStrip(LatchedLED::STRIP);
 LatchedLED ledDigit(LatchedLED::SEVEN_SEG);
 
-<<<<<<< HEAD
-// Switches // TODO: This seems to be an alternative to btns; delete after if not used
-DigitalIn btnA(PG_0);
-
-=======
->>>>>>> parent of d302256 (Experimental set datetime code)
 //Buzzer
 Buzzer buzz;
 
@@ -74,18 +68,6 @@ static InterruptIn sd_inserted(PF_4); // Interrupt for card insertion events
  - Passive: 5, 6, 7, 10, 11
 */
 
-<<<<<<< HEAD
-void change_part()
-{
-    dt_part = (dt_part == 6) ? 0 : dt_part + 1; // Increment until 6, then wrap to 0
-}
-void display_datetime()
-{
-    ++second;
-}
-
-=======
->>>>>>> parent of d302256 (Experimental set datetime code)
 // Remember that main() runs in its own thread in the OS
 int main()
 {
@@ -111,164 +93,7 @@ int main()
     read_sd();
 
     /* END Requirement 2 - SD Card Writing */
-<<<<<<< HEAD
 
-    /* START Requirement 4 - Set Date/Time */
-    
-    // I think that the main thread should always be looking out for changes to the switches/potentiometer
-    // If not, can always run it on another thread
-
-    printf("Hello?");
-
-    ticker.attach(&display_datetime, 1000ms);
-    while(true)
-    {
-        sleep();
-
-        lcd_disp.printf("%02d/%02d/%04d @ %02d:%02d:%02d", day, month, year, hour, minute, second);
-
-        if(btnA != 0) // User is required to hold the button for up to a second
-            change_part();
-
-        while(dt_part == 1) // DAY
-        {
-            // Handle potentiometer turns. Function would cause a lot of overhead
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - POT_TOLERANCE > pot_old  || pot_val + POT_TOLERANCE < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > POT_HALFWAY);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            // TODO: It's times like this that I used some sort of class or struct to handle this crap - Nicholas would probably appreciate it and it would look good, right?
-            //  - How important is space/time efficiency vs. code neatness and good practice, here? I need to know. Don't delete this TODO until I've found out.
-            if(pot_mod == 1)
-            {
-                if(day == 31 || (day == 30 && (month == 4 || month == 6 || month == 9 || month == 11)) || (day == 28 && month == 2))
-                    day = 1;
-                else
-                    ++day;
-            }
-            else if(pot_mod == -1)
-            {
-                if(day == 1)
-                {
-                    if(month == 2)
-                        day = 28;
-                    else if(month == 4 || month == 6 || month == 9 || month == 11)
-                        day = 30;
-                    else
-                        day = 31;
-                }
-            }
-        }        
-
-        while(dt_part == 2) // MONTH
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - POT_TOLERANCE > pot_old  || pot_val + POT_TOLERANCE < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > POT_HALFWAY);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            if(pot_mod == 1) month = (month == 12) ? 1 : month + 1;
-            if(pot_mod == -1) month = (month == 1) ? 12 : month - 1;
-        }
-
-        while(dt_part == 3) // YEAR
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - POT_TOLERANCE > pot_old  || pot_val + POT_TOLERANCE < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > POT_HALFWAY);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            year += pot_mod;
-        }
-
-        while(dt_part == 4) // HOUR
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - POT_TOLERANCE > pot_old  || pot_val + POT_TOLERANCE < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > POT_HALFWAY);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            if(pot_mod == 1) hour = (hour == 23) ? 0 : hour + 1;
-            if(pot_mod == -1) hour = (hour == 0) ? 23 : hour - 1;
-        }
-
-        while(dt_part == 5) // MINUTE
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - POT_TOLERANCE > pot_old  || pot_val + POT_TOLERANCE < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > POT_HALFWAY);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            if(pot_mod == 1) minute = (minute == 59) ? 0 : minute + 1;
-            if(pot_mod == -1) minute = (minute == 0) ? 59 : minute - 1;
-        }
-
-        while(dt_part == 6) // SECOND
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - POT_TOLERANCE > pot_old  || pot_val + POT_TOLERANCE < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > POT_HALFWAY);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            if(pot_mod == 1) second = (second == 59) ? 0 : second + 1;
-            if(pot_mod == -1) second = (second == 0) ? 59 : second - 1;
-        }
-        
-        pot_old = 0; // TODO: This must happen after each button press to rest it. Test if it does (I'm not sure if a full loop is done with each button press or not. I think maybe not)
-
-        // This entire thing would better be written with interrupts:
-        // Constantly display date/time
-        // When interrupt fires, modify variable so date/time flickers the currently-selected part (e.g. refresh = 0 and part = "", then refresh = 500 & part = "hour")
-        // Loop a thread that handles potentiometer turning left and right, until another button press interrupts and selects a new part. The loop ends after seconds have been set
-               
-
-    }
-
-    /* END Requirement 4 - Set Date/Time */
-=======
->>>>>>> parent of d302256 (Experimental set datetime code)
 }
 
 int write_sd() {
