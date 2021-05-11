@@ -33,8 +33,7 @@ LatchedLED ledStrip(LatchedLED::STRIP);
 LatchedLED ledDigit(LatchedLED::SEVEN_SEG);
 
 // Switches // TODO: This seems to be an alternative to btns; delete after if not used
-InterruptIn swA(PG_0);
-DigitalIn swB(PG_1);
+DigitalIn btnA(PG_0);
 
 //Buzzer
 Buzzer buzz;
@@ -154,7 +153,7 @@ void change_part()
 }
 void display_datetime()
 {
-    lcd_disp.printf("%02d/%02d/%04d @ %02d:%02d:%02d", day, month, year, hour, minute, second);
+    ++second;
 }
 
 // Remember that main() runs in its own thread in the OS
@@ -166,15 +165,16 @@ int main()
     // This shall include temperature (deg C), pressure (mbar) and light levels (from the LDR). 
     // The default update rate shall be once every second and you should write your code to sampling minimize jitter. 
     // The data shall be encapsulated in a single C++ structure or class
-
+    printf("Heleeeeeeeelo?");
     //Environmental sensor
     bmp280.initialize();
 
     //tDebug.start(debugStuff);
-    tSample.start(sampleEnvironment);
+    //tSample.start(sampleEnvironment);
 
     /* END Requirement 1 */
 
+    printf("Hellofeffefef?");
     /* START Requirement 2 - SD Card Writing */
     
     write_sd();
@@ -187,11 +187,17 @@ int main()
     // I think that the main thread should always be looking out for changes to the switches/potentiometer
     // If not, can always run it on another thread
 
-    swA.rise(&change_part);
+    printf("Hello?");
+
     ticker.attach(&display_datetime, 1000ms);
     while(true)
     {
         sleep();
+
+        lcd_disp.printf("%02d/%02d/%04d @ %02d:%02d:%02d", day, month, year, hour, minute, second);
+
+        if(btnA != 0) // User is required to hold the button for up to a second
+            change_part();
 
         while(dt_part == 1) // DAY
         {
