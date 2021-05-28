@@ -5,6 +5,9 @@
 #include "SDBlockDevice.h"
 #include "FATFileSystem.h"
 
+#define BUFFER_SIZE       1024  // Sufficient to hold 16 samples (sample size max. 64 bytes)
+#define CONSUME_THRESHOLD 768   // Consume once 75% full (12 samples) to mitigate/prevent buffer full error
+
 using namespace uop_msb_200;
 using namespace std;
 
@@ -14,6 +17,8 @@ extern int read_sdcard();
 extern void matrix_init(void);
 extern void matrix_scan(void);
 extern void clearMatrix(void);
+
+
 
 //Digital Inputs (you could use DigitalIn or InterruptIn instead)
 Buttons btns;
@@ -39,11 +44,25 @@ LCD_16X2_DISPLAY lcd_disp;
 Ticker ticker;
 
 // Functions //
+// TODO: Make sure they're all here
 void debugStuff();
 void sampleEnvironment();
+void handleDatetimeChange();
 int write_sd();
 int read_sd();
-void datetime_stuff();
+
+BMP280_SPI bmp280(PB_5, PB_4, PB_3, PB_2);
+
+// SD Card
+static SDBlockDevice sd_mine(PB_5, PB_4, PB_3, PF_3); // SD Card Block Device
+static InterruptIn sd_inserted(PF_4); // Interrupt for card insertion events // TODO: If SD card hasn't been inserted, this should switch a boolean to let SD writes happen
+
+// Globals
+int dt_part = 0; // Date/Time Set Part [0: wait, 1: day, 2: month, 3: year, 4: hour, 5: minute, 6: second]. Not enum because can't ++dt_part if enum
+int day = 1, month = 1, year = 1970, hour = 0, minute = 0, second = 0; // Datetime data (no need to use a heavy class/struct here unless spec requires it)
+bool date_changing = false;
+bool write_block = true;
+
 
 // Threads //
 // You should use at least 4 separate and dedicated threads for:
@@ -53,65 +72,9 @@ void datetime_stuff();
 //  - (iv) communicating with the network. 
 //  - Event Queues are recommended but not a requirement. In addition, you may also use interrupts if appropriate and where justified, again with suitable synchronization.
 Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange;
-Thread tDebug;
+Thread tDebug; // TODO: Delete before uploading to DLE
 
 // Classes & Structs //
-class FIFO_Buffer
-{
-    // TODO: Use C++ templates for higher marks
-    // TODO: Full buffer = critical error event, "reported" (presumably he means logged, as well)
-    // TODO: Use RTOS APIs to make it thread-safe
-    // TODO: FIFO read should be blocking
-    // TODO: All thread synchronization should be handled by the class member functions
-
-    public:
-        char buffer[1024]; // TODO: Determine size of buffer; determine if "string" is the best data type, here. Might be oversized
-    private:
-        int itemCount = 0, freeSpace = 1024;
-
-    Thread tProducer, tConsumer;
-
-    public:
-        void produce(string message)
-        {
-            // I don't think this is the way to do this atm; I'm just laying the groundwork of the logic or whatever
-            // If there isn't enough space
-            if(freeSpace < message.size())
-            {
-                // Sleep the producer AND trigger the consumer
-                // The consumer will have woken the producer - add the message to the buffer
-                //  - What happens if another produce() call is made while we're waiting for consumer() to finish? Consumer is blocking, so that will pause any more producer() calls?
-                //  - Or will the data from other producer() calls somehow be preserved on the stack/heap until consumer unblocks?
-            }
-            else
-            {
-                // Write to the buffer, decrement freeSpace with the size of the message (?)
-
-                // Also, call to consume if threshold reached
-                if(itemCount >= 768)
-                {
-                    consume(); // TODO: Obviously not just this; set on own thread and block etc.
-                }
-            }
-        }
-
-    // Consume the entire buffer (used for writing blocks to the SD card)
-    // The "read" operation (should be blocking)
-    void consume()
-    {        
-        if(tSDWrite.start(write_sd) == 0)
-        {
-            freeSpace = 1024;
-            itemCount = 0;
-            memset(buffer, 0, 1024); // Clear the buffer... hopefully
-        }
-
-        // Could also consider returning the address of the buffer and having it empty itself upon some sort of callback from sd_write()
-        //  - Perhaps call sd_write() in here
-    }
-};
-FIFO_Buffer fifoBuffer;
-
 struct SensorData
 {
     // TODO: Data types probably incorrect
@@ -121,45 +84,186 @@ struct SensorData
 };
 SensorData sensorData;
 
-BMP280_SPI bmp280(PB_5, PB_4, PB_3, PB_2);
+class FIFO_Buffer
+{
+    // TODO: Use C++ templates for higher marks
+    // TODO: Use RTOS APIs to make it thread-safe
+    // TODO: All thread synchronization should be handled by the class member functions
 
-// SD Card
-static SDBlockDevice sd_mine(PB_5, PB_4, PB_3, PF_3); // SD Card Block Device
-static InterruptIn sd_inserted(PF_4); // Interrupt for card insertion events
+    public:
+        char buffer[BUFFER_SIZE]; // TODO: Make this fixed-size in memory somehow (figure out the char array into string bs)        
+        Thread tProducer, tConsumer;
+    private:
+        int itemCount = 0, freeSpace = BUFFER_SIZE;
 
-// Globals
-int dt_part = 0; // Date/Time Set Part [0: wait, 1: day, 2: month, 3: year, 4: hour, 5: minute, 6: second]. Not enum because can't ++dt_part if enum
-float pot_old = 0; // Previous value of potentiometer
-int day = 1, month = 1, year = 1970, hour = 0, minute = 0, second = 0; // Datetime data (no need to use a heavy class/struct here unless spec requires it)
+
+    public:
+        void produce(string message)
+        {
+            size_t message_length = message.length();
+
+            // If there isn't enough space
+            if(freeSpace < message_length)
+            {
+                printf("NOT ENOUGH SPACE\n");
+
+                // TODO: Full buffer = critical error event, "reported" (presumably he means logged, as well)
+            }
+            else
+            {
+                printf("WRITING TO BUFFER...\n");   
+                printf("%s", buffer);
+                printf("Space: %d\n", freeSpace);
+                printf("Count: %d\n", itemCount);
+
+                // Write to the buffer, decrement freeSpace with the size of the message          
+                strncat(buffer, message.c_str(), message_length);
+                freeSpace -= message_length;
+                itemCount += message_length;
+
+                // Also, call to consume if threshold reached
+                if(itemCount >= CONSUME_THRESHOLD)
+                {
+                    // TODO: FIFO read should be blocking (fifoBuffer is read in the write_sd() function. Should block production until read is finished, I guess)
+                    consume();
+                }
+            }
+        }
+
+        // Consume the entire buffer (used for writing blocks to the SD card)
+        // The "read" operation (should be blocking)
+        void consume()
+        {        
+            printf("CONSUMING...\n"); 
+
+            /* START Requirement 2 - SD Card Writing */
+
+            // TODO: Instead of this, send signal to write_sd thread SOMEHOW. Or an interrupt or something. Anything to wake it up.
+            write_block = false;
+
+            /* END Requirement 2 - SD Card Writing */
+        }
+
+        // TODO: This should block produce(). Use a Mutex, I guess. Or a lock or something.
+        string readBuffer()
+        {
+            char buffer_copy[BUFFER_SIZE];
+            strcpy(buffer_copy, buffer);
+            freeSpace = 1024;
+            itemCount = 0;
+            memset(buffer, 0, sizeof buffer); // Clear the buffer
+            return buffer_copy;
+        }
+
+};
+FIFO_Buffer fifoBuffer;
+
+struct Datetime
+{
+    char day = 1;
+    char month = 1;
+    unsigned short year = 2021;
+    char hour;
+    char minute;
+    char second;
+
+    // Increment the time. Called every 1s
+    void timeInc()
+    {
+        if(this->second == 59)
+        {
+            this->second = 0;
+
+            if(this->minute == 59)
+            {
+                this->minute = 0;
+                
+                if(this->hour == 23)
+                {
+                    this->hour = 0;
+
+                    if((this->day == 30 && (this->month == 4 || this->month == 6 || this->month == 9 || this->month == 11)) || 
+                    (this->day == 28 && (this->month == 2)) || 
+                    (this->day == 31 && (this->month == 1 || this->month == 3 || this->month == 5 || this->month == 7 || this->month == 8 || this->month == 10 || this->month == 12)))
+                    {
+                        this->day = 1;
+                        
+                        if(this->month == 12)
+                        {
+                            this->month = 1;
+
+                            ++this->year;
+                        }
+                        else
+                        {
+                            ++this->month;
+                        }
+                    }
+                    else
+                    {
+                        ++this->day;
+                    }
+                }
+                else 
+                {
+                    ++this->hour;
+                }
+            }
+            else
+            {
+                ++this->minute;
+            }
+        }
+        else
+        {
+            ++this->second;
+        }
+    }    
+};
+Datetime dateTime;
 
 /* Requirements *
  - Active: 1, 2, 3, 4, 8, 9, 12, 13
  - Passive: 5, 6, 7, 10, 11
 */
 
-void change_part()
+void changePart() 
 {
-    dt_part = (dt_part == 6) ? 0 : dt_part + 1; // Increment until 6, then wrap to 0
+  dt_part = (dt_part < 5) ? dt_part + 1 : 0; // If it's already 5, then set to 0
+  date_changing = dt_part != 0;              // If 0, stop changing
 }
-void display_datetime()
+void displayDatetime()
 {
+    // Requirement TODO: lcd_disp.printf()s should be done through the serial communication thread (tSerialComm)
     while(true)
     {
         lcd_disp.cls();
-        lcd_disp.printf("%02d/%02d/%04d @ %02d:%02d:%02d", day, month, year, hour, minute, second);
+        lcd_disp.printf("%04d-%02d-%02d %02d:%02d", dateTime.year, dateTime.month, dateTime.day, dateTime.hour, dateTime.minute); // ISO 8601-compliant
+
+        // Indicate being-changed part (why doesn't English have imperfect adjectival verbs?)
+        if(date_changing)
+        {            
+            int offset = (dt_part >=2) ? 2 : 1; // Year needs +1 offset; others need +2 offset
+
+            // Indicate which datetime part is being changed
+            lcd_disp.locate(1, ((dt_part-1) * 3) + offset);
+            lcd_disp.printf("^^");
+        }
+        
         ThisThread::sleep_for(1000ms);
     }
     
 }
-void time_inc()
+void timeInc()
 {
-    ++second; // TODO: Obviously this will have to be more sophisticated. Class/struct or not? Ask Nick
+    // Performance TODO: This will cause quite a bit of overhead. Find a way to call struct function with attach()
+    //  - Otherwise, just keep put the time tracking logic in here, I guess... Maybe keep the data global. Ugly, though
+    dateTime.timeInc();
 }
 
 // Remember that main() runs in its own thread in the OS
 int main()
 {
-
     /* START REQUIREMENT 1 - Environmental Sensor */
     // This device shall periodically measure sensor data at a fixed and deterministic rate. 
     // This shall include temperature (deg C), pressure (mbar) and light levels (from the LDR). 
@@ -171,210 +275,123 @@ int main()
 
     //tDebug.start(debugStuff);
     tSample.start(sampleEnvironment);
-    tDatetime.start(display_datetime);
-    tDatetimeChange.start(datetime_stuff);
+    tDatetime.start(displayDatetime);
+    tDatetimeChange.start(handleDatetimeChange);
+    tSDWrite.start(write_sd); // TODO: If this doesn't work, write_sd() doesn't seem to work when running on a thread
+    
 
     /* END Requirement 1 */
-
-    /* START Requirement 2 - SD Card Writing */
-
-    //write_sd();
-    //read_sd();
-
-    /* END Requirement 2 - SD Card Writing */
 }
 
-void datetime_stuff()
+void handleDatetimeChange()
 {
-    printf("Hello?\n");
+    /* START Requirement 4 - Set Date/Time */
+    // TODO: Consider: 
+    //          - Making btnB allow the user to go back a part
+        
+    btnA.rise(&changePart);
+    ticker.attach(&timeInc, 1000ms);
+    while (true) 
+    {
+        if (!date_changing)
+            ThisThread::sleep_for(5000ms); // Check for initiation button press every 5 second
 
-    //btnA.rise(&change_part); // Why don't you work, damn it? TODO: Ask Nicholas (perhaps in labs)
-    ticker.attach(&time_inc, 1000ms);
+        if (dt_part == 1) // YEAR
+        {
+            // Read potentiometer and check if it's been moved up or down since last read
+            float pot_val = pot.read();
+            int direction = 0; // 0 == stable
+            if(pot_val > 0.66) direction = 1;
+            else if(pot_val < 0.33) direction = -1;
+
+            printf("POT_VAL %f | DIRECTION %d | YEAR %d\n", pot_val, direction, dateTime.year);
+
+            if(direction != 0) dateTime.year += direction;
+            ThisThread::sleep_for(1000ms); // TODO: Make sure this can't be interrupted
+        }
+        else if (dt_part == 2) // MONTH
+        {
+            float pot_val = pot.read();
+
+            dateTime.month = 12 * pot_val;
+            if (dateTime.month == 0) dateTime.month = 1;
+        }
+        else if (dt_part == 3) // DAY
+        {
+            float pot_val = pot.read(); // Percentage of max value for day
+
+            if (dateTime.month == 4 || dateTime.month == 6 || dateTime.month == 9 || dateTime.month == 11)
+                dateTime.day = 30 * pot_val;
+            else if (dateTime.month == 2) // Ah, February... the ultimate edge case.
+                dateTime.day = 28 * pot_val;
+            else
+                dateTime.day = 31 * pot_val;
+            if (dateTime.day == 0)
+                dateTime.day = 1; // Minimum allowed day
+        }
+        else if (dt_part == 4) // HOUR
+        {
+            float pot_val = pot.read();
+
+            dateTime.hour = 23 * pot_val; // Between 00:00 and 23:00, so slightly different than other percentile calculations
+        }
+        else if (dt_part == 5) // MINUTE
+        {
+            float pot_val = pot.read();
+
+            dateTime.minute = 59 * pot_val;
+        }
+
+        // TODO: Better yet, stop timeInc from ticking until this operation is complete
+        dateTime.second = 0; // Reset second so it doesn't change the minute outside of user control
+    }
+
+    /* END Requirement 4 - Set Date/Time */
+}
+
+int write_sd() 
+{    
+    // TODO: Why aren't there any signals, damn it?
+    // TODO: Log the event
     while(true)
     {
-        if(btnA != 0) // User is required to hold the button for up to a second
-            change_part();
-        else 
+        if(write_block)
+        {
             ThisThread::sleep_for(1000ms);
-
-        printf("Pre-while part: %d\n", dt_part);
-
-        while(dt_part == 1) // DAY
+        }
+        else
         {
-            // TODO (next): Works, just should detect velocity rather than rise/fall like Pong
-            //  - Alternatively, use it as a wheel by taking max voltage and dividing by 31 (but that's probably shit: not sensitive enough, too noisy, not the same max every time, etc.)
-            // Handle potentiometer turns. Function would cause a lot of overhead
-            float pot_val = pot.read();
-            float delta = pot_old - pot_val;
-            bool stable = abs(delta) < 0.04f; // Tolerance to prevent change from noise. If within tolerance level, it's stable (not up or down)        
-            bool up = pot_val > pot_old;  // If higher than old value, it's going up. Otherwise, it's going down
+            write_block = true;
+            string buffer_contents = fifoBuffer.readBuffer(); // TODO: Should be blocking
 
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
+            printf("Initialise and write to a file\n");
 
-            printf("Pot VAL: %f\n", pot_val);
-            printf("Pot OLD: %f\n", pot_old);
-            printf("DELTA: %f\n", delta);
-            printf("--------------------------------\n");
-            printf("UP: %d\n", up);
-            printf("STABLE: %d\n", stable);
-            printf("--------------------------------\n");
-
-            // Store current values
-            pot_old = pot_val;
-
-            printf("PART 1 pot_mod: %d\n", pot_mod);
-
-            // TODO: It's times like this that I used some sort of class or struct to handle this crap - Nicholas would probably appreciate it and it would look good, right?
-            //  - How important is space/time efficiency vs. code neatness and good practice, here? I need to know. Don't delete this TODO until I've found out.
-            if(pot_mod == 1)
-            {
-                if(day == 31 || (day == 30 && (month == 4 || month == 6 || month == 9 || month == 11)) || (day == 28 && month == 2))
-                    day = 1;
-                else
-                    ++day;
+            // call the SDBlockDevice instance initialisation method.
+            if (0 != sd_mine.init()) {
+                printf("Init failed \n");
+                return -1;
             }
-            else if(pot_mod == -1)
+
+            FATFileSystem fs("sd", &sd_mine);
+            FILE *fp = fopen("/sd/sensor_data.txt", "w");
+
+            if (fp == NULL)
             {
-                if(day == 1)
-                {
-                    if(month == 2)
-                        day = 28;
-                    else if(month == 4 || month == 6 || month == 9 || month == 11)
-                        day = 30;
-                    else
-                        day = 31;
-                }
-                else
-                    --day;
-            }         
-        }        
-
-        while(dt_part == 2) // MONTH
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - 3000 > pot_old  || pot_val + 3000 < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > 32767);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            if(pot_mod == 1) month = (month == 12) ? 1 : month + 1;
-            if(pot_mod == -1) month = (month == 1) ? 12 : month - 1;
+                printf("Cannot be opened");
+                // File could not be opened for write
+                sd_mine.deinit();
+                return -1;
+            } 
+            else 
+            {        
+                // TODO: This read should be blocking (will need to figure out the fucking internal class threads, then. Joyous)
+                printf("BRO %s\n", buffer_contents.c_str());
+                fprintf(fp, "%s", buffer_contents.c_str());
+                fclose(fp);
+                return sd_mine.deinit(); // Returns 0
+            } 
         }
-
-        while(dt_part == 3) // YEAR
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - 3000 > pot_old  || pot_val + 3000 < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > 32767);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            year += pot_mod;
-        }
-
-        while(dt_part == 4) // HOUR
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - 3000 > pot_old  || pot_val + 3000 < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > 32767);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            if(pot_mod == 1) hour = (hour == 23) ? 0 : hour + 1;
-            if(pot_mod == -1) hour = (hour == 0) ? 23 : hour - 1;
-        }
-
-        while(dt_part == 5) // MINUTE
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - 3000 > pot_old  || pot_val + 3000 < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > 32767);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            if(pot_mod == 1) minute = (minute == 59) ? 0 : minute + 1;
-            if(pot_mod == -1) minute = (minute == 0) ? 59 : minute - 1;
-        }
-
-        while(dt_part == 6) // SECOND
-        {
-            // Handle potentiometer turns
-            unsigned short pot_val = pot.read_u16();            
-            unsigned short delta = pot_old - pot_val;            
-            bool stable = !(pot_val - 3000 > pot_old  || pot_val + 3000 < pot_old); // Tolerance to prevent noise from causing change
-            int up = (!stable && pot_val > 32767);  // If turned over halfway, it's going up. Otherwise, it's going down
-
-            // Store current values
-            pot_old = pot_val;
-
-            // Convert to operand values
-            int pot_mod = (stable) ? 0 : ((up) ? 1 : -1);
-
-            if(pot_mod == 1) second = (second == 59) ? 0 : second + 1;
-            if(pot_mod == -1) second = (second == 0) ? 59 : second - 1;
-        }
-        
-        //pot_old = 0; // TODO: This must happen after each button press to rest it. Test if it does (I'm not sure if a full loop is done with each button press or not. I think maybe not)
-
-        // This entire thing would better be written with interrupts:
-        // Constantly display date/time
-        // When interrupt fires, modify variable so date/time flickers the currently-selected part (e.g. refresh = 0 and part = "", then refresh = 500 & part = "hour")
-        // Loop a thread that handles potentiometer turning left and right, until another button press interrupts and selects a new part. The loop ends after seconds have been set               
-               
-        ThisThread::sleep_for(1000ms);
-
     }
-}
-
-int write_sd() {
-  printf("Initialise and write to a file\n");
-
-  // call the SDBlockDevice instance initialisation method.
-    if (0 != sd_mine.init()) {
-        printf("Init failed \n");
-        return -1;
-    }
-
-    FATFileSystem fs("sd", &sd_mine);
-    FILE *fp = fopen("/sd/sensor_data.txt", "w");
-
-    if (fp == NULL)
-    {
-        // File could not be opened for write
-        sd_mine.deinit();
-        return -1;
-    } 
-    else 
-    {        
-        fprintf(fp, "%s", fifoBuffer.buffer);
-        fclose(fp);
-        return sd_mine.deinit(); // Returns 0
-    }  
 }
 
 int read_sd()
@@ -398,26 +415,17 @@ int read_sd()
     else 
     {
         // Read the file
-        /*
         char buff[64];
         buff[63] = 0;
         while (!feof(fp)) 
         {
             fgets(buff, 63, fp);
-            printf("%s\n", buff);
+            printf("%s", buff);
         }
         // Tidy up here
-        */
         fclose(fp);
         return sd_mine.deinit();
     }
-}
-
-void debugStuff()
-{
-    // Sensor data
-    while(true)
-        printf("Temperature: %f || Pressure: %f || Light: %f\n", sensorData.temperature, sensorData.pressure, sensorData.light_level);
 }
 
 void sampleEnvironment()
@@ -432,8 +440,14 @@ void sampleEnvironment()
         sensorData.pressure = bmp280.getPressure();
 
         // TODO: send data to FIFO buffer (on this thread(?))
-        string message = "Temperature: "+to_string(sensorData.temperature)+" || Pressure: "+to_string(sensorData.pressure)+" || Light: "+to_string(sensorData.light_level)+"\n";
-        fifoBuffer.produce(message);
+        // TODO: MIght be overhead on to_string() call; if there is jitter, consider correcting this somehow        
+
+        string message = "Temp: "+to_string(sensorData.temperature)+" || Pressure: "+to_string(sensorData.pressure)+" || Light: "+to_string(sensorData.light_level)+"\n";        
+
+        if(message.length() <= 64)
+            fifoBuffer.produce(message);
+        else
+            printf("ERROR: Sample message length too long (%d)!\n", message.length());
 
         // Wait a second (minus however long it took? Timer would probably cause overhead, though)
         ThisThread::sleep_for(1000ms);
