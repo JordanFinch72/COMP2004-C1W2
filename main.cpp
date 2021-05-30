@@ -1,24 +1,17 @@
 #include "mbed.h"
 #include "uop_msb_2_0_0.h"
+#include <chrono>
+#include <cstdio>
 #include <iostream>
 #include "BMP280_SPI.h"
 #include "SDBlockDevice.h"
 #include "FATFileSystem.h"
 
-#define BUFFER_SIZE       1024  // Sufficient to hold 16 samples (sample size max. 64 bytes)
-#define CONSUME_THRESHOLD 768   // Consume once 75% full (12 samples) to mitigate/prevent buffer full error
+#define BUFFER_SIZE       16
+#define CONSUME_THRESHOLD 12  // Consume once 75% full (12 samples) to mitigate/prevent buffer full error
 
 using namespace uop_msb_200;
 using namespace std;
-
-// C Function Prototypes
-extern int write_sdcard();
-extern int read_sdcard(); 
-extern void matrix_init(void);
-extern void matrix_scan(void);
-extern void clearMatrix(void);
-
-
 
 //Digital Inputs (you could use DigitalIn or InterruptIn instead)
 Buttons btns;
@@ -31,8 +24,7 @@ AnalogIn ldr(AN_LDR_PIN);
 AnalogIn pot(PA_0);
 
 //LED Outputs
-LatchedLED ledStrip(LatchedLED::STRIP);
-LatchedLED ledDigit(LatchedLED::SEVEN_SEG);
+DigitalOut redLED(TRAF_RED1_PIN);
 
 //Buzzer
 Buzzer buzz;
@@ -48,7 +40,9 @@ Ticker ticker;
 void debugStuff();
 void sampleEnvironment();
 void handleDatetimeChange();
-int write_sd();
+void write_sd();
+void logMessage(string, bool);
+void logThread();
 int read_sd();
 
 BMP280_SPI bmp280(PB_5, PB_4, PB_3, PB_2);
@@ -59,10 +53,14 @@ static InterruptIn sd_inserted(PF_4); // Interrupt for card insertion events // 
 
 // Globals
 int dt_part = 0; // Date/Time Set Part [0: wait, 1: day, 2: month, 3: year, 4: hour, 5: minute, 6: second]. Not enum because can't ++dt_part if enum
-int day = 1, month = 1, year = 1970, hour = 0, minute = 0, second = 0; // Datetime data (no need to use a heavy class/struct here unless spec requires it)
-bool date_changing = false;
-bool write_block = true;
+Semaphore semWrite;
+Semaphore semSample(1);
+chrono::milliseconds sample_rate = 1000ms;
+Semaphore semLogging(1);
+bool loggingEnabled = false;
+EventQueue logQueue;
 
+Semaphore semDateChanging;
 
 // Threads //
 // You should use at least 4 separate and dedicated threads for:
@@ -71,7 +69,7 @@ bool write_block = true;
 //  - (iii) communicating with the serial interface 
 //  - (iv) communicating with the network. 
 //  - Event Queues are recommended but not a requirement. In addition, you may also use interrupts if appropriate and where justified, again with suitable synchronization.
-Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange;
+Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange, tLogging;
 Thread tDebug; // TODO: Delete before uploading to DLE
 
 // Classes & Structs //
@@ -81,91 +79,46 @@ struct SensorData
     float temperature;
     float pressure;
     float light_level;
+
+    SensorData(){}
+    SensorData(float temp, float pres, float light)
+    {
+        temperature = temp;
+        pressure = pres;
+        light_level = light;
+    }
+
+    char* getData()
+    {
+        char* data = (char*) malloc(64 * sizeof(char));
+        sprintf(data, "Temp: %.2fC | Pressure: %.2fmBar | Light: %.4fV", this->temperature, this->pressure, this->light_level);
+        return data;
+    }
 };
-SensorData sensorData;
-
-class FIFO_Buffer
-{
-    // TODO: Use C++ templates for higher marks
-    // TODO: Use RTOS APIs to make it thread-safe
-    // TODO: All thread synchronization should be handled by the class member functions
-
-    public:
-        char buffer[BUFFER_SIZE]; // TODO: Make this fixed-size in memory somehow (figure out the char array into string bs)        
-        Thread tProducer, tConsumer;
-    private:
-        int itemCount = 0, freeSpace = BUFFER_SIZE;
-
-
-    public:
-        void produce(string message)
-        {
-            size_t message_length = message.length();
-
-            // If there isn't enough space
-            if(freeSpace < message_length)
-            {
-                printf("NOT ENOUGH SPACE\n");
-
-                // TODO: Full buffer = critical error event, "reported" (presumably he means logged, as well)
-            }
-            else
-            {
-                printf("WRITING TO BUFFER...\n");   
-                printf("%s", buffer);
-                printf("Space: %d\n", freeSpace);
-                printf("Count: %d\n", itemCount);
-
-                // Write to the buffer, decrement freeSpace with the size of the message          
-                strncat(buffer, message.c_str(), message_length);
-                freeSpace -= message_length;
-                itemCount += message_length;
-
-                // Also, call to consume if threshold reached
-                if(itemCount >= CONSUME_THRESHOLD)
-                {
-                    // TODO: FIFO read should be blocking (fifoBuffer is read in the write_sd() function. Should block production until read is finished, I guess)
-                    consume();
-                }
-            }
-        }
-
-        // Consume the entire buffer (used for writing blocks to the SD card)
-        // The "read" operation (should be blocking)
-        void consume()
-        {        
-            printf("CONSUMING...\n"); 
-
-            /* START Requirement 2 - SD Card Writing */
-
-            // TODO: Instead of this, send signal to write_sd thread SOMEHOW. Or an interrupt or something. Anything to wake it up.
-            write_block = false;
-
-            /* END Requirement 2 - SD Card Writing */
-        }
-
-        // TODO: This should block produce(). Use a Mutex, I guess. Or a lock or something.
-        string readBuffer()
-        {
-            char buffer_copy[BUFFER_SIZE];
-            strcpy(buffer_copy, buffer);
-            freeSpace = 1024;
-            itemCount = 0;
-            memset(buffer, 0, sizeof buffer); // Clear the buffer
-            return buffer_copy;
-        }
-
-};
-FIFO_Buffer fifoBuffer;
 
 struct Datetime
 {
     char day = 1;
     char month = 1;
     unsigned short year = 2021;
-    char hour;
-    char minute;
-    char second;
+    unsigned short hour;
+    unsigned short minute;
+    unsigned short second;
+
+    char* getTimestamp()
+    {
+        char* timestamp = (char*) malloc(20 * sizeof(char));
+        sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:%02d", this->year, this->month, this->day, this->hour, this->minute, this->second); // ISO 8601-compliant
+        return timestamp;
+    }
+
+    // Returns timestamp fit for LCD display: removes seconds as (a) they are not set; (b) they trail off the display and it looks ugly
+    char* getTimestampLCD()
+    {
+        char* timestamp = (char*) malloc(16 * sizeof(char));
+        sprintf(timestamp, "%04d-%02d-%02d %02d:%02d", this->year, this->month, this->day, this->hour, this->minute);
+        return timestamp;
+    }
 
     // Increment the time. Called every 1s
     void timeInc()
@@ -194,33 +147,127 @@ struct Datetime
 
                             ++this->year;
                         }
-                        else
-                        {
-                            ++this->month;
-                        }
+                        else ++this->month;
                     }
-                    else
-                    {
-                        ++this->day;
-                    }
+                    else ++this->day;
                 }
-                else 
-                {
-                    ++this->hour;
-                }
+                else ++this->hour;
             }
-            else
-            {
-                ++this->minute;
-            }
+            else ++this->minute;
         }
-        else
-        {
-            ++this->second;
-        }
+        else ++this->second;
     }    
 };
 Datetime dateTime;
+
+class FIFO_Buffer
+{
+    // TODO: Use C++ templates for higher marks
+    // TODO: Use RTOS APIs to make it thread-safe
+    // TODO: All thread synchronization should be handled by the class member functions
+    //  - However that doesn't seem bloody possible.
+
+    struct BufferData
+    {
+        Datetime dateTime;
+        SensorData sensorData;        
+
+        BufferData(){}
+        BufferData(Datetime time, SensorData data)
+        {
+            dateTime = time;
+            sensorData = data;
+        }
+
+        char* getData()
+        {
+            char* data = (char*) malloc(128 * sizeof(char));
+            sprintf(data, "[%s] %s\n", this->dateTime.getTimestamp(), this->sensorData.getData());
+            return data;
+        }
+    };
+
+    public:
+        BufferData buffer[BUFFER_SIZE]; // No need to dynamically expand: buffer is to buffer SD writes, not memory
+        Thread tProducer, tConsumer; // Can't start threads inside a class?
+    private:
+        int itemCount = 0, freeSpace = BUFFER_SIZE; // TODO: Convert these to semaphores...
+        Mutex bufferLock;
+
+    public:    
+        void produce(SensorData sensorData)
+        {
+            // If there isn't enough space
+            if(freeSpace <= 0)
+            {
+                logQueue.call(logMessage, "[ERROR] Buffer full.", true);
+            }
+            else
+            {
+                // Write to the buffer, update counters
+                bufferLock.lock();
+                    buffer[itemCount++] = BufferData(dateTime, sensorData);
+                    --freeSpace;
+                    //printf("%s", buffer[itemCount-1].getData());
+                    //printf("Space: %d\n", freeSpace);
+                    //printf("Count: %d\n", itemCount);
+                bufferLock.unlock();
+
+                // Also, call to consume if threshold reached
+                if(itemCount >= CONSUME_THRESHOLD)
+                {                    
+                    consume();
+                }
+            }
+        }
+
+        // Important TODO: "ONCE A MINUTE BEING THE MOST FREQUENT, ONE AN HOUR BEING THE SLOWEST"
+        // Consume the entire buffer (used for writing blocks to the SD card)
+        // The "read" operation (should be blocking)
+        void consume()
+        {        
+            //printf("CONSUMING...\n"); 
+
+            /* START Requirement 2 - SD Card Writing */
+
+            // Release sempahore for the tSDWrite thread.
+            semWrite.release();
+
+            /* END Requirement 2 - SD Card Writing */
+        }
+
+        // TODO: This should block produce(). Use a Mutex, I guess. Or a lock or something.
+        string readBuffer(int end, int start = 0, bool flush = false)
+        {            
+            bufferLock.lock();
+                BufferData buffer_copy[BUFFER_SIZE];            // Make a copy of buffer
+                memcpy(buffer_copy, buffer, sizeof(buffer));
+                if(end < 0 || end > itemCount) end = itemCount; // If READBUFFER -1 or READBUFFER <number_greater_than_itemcount>, return all
+                // Clear the buffer
+                if(flush)
+                {
+                    freeSpace = BUFFER_SIZE;                       
+                    itemCount = 0;
+                    memset(buffer, 0, sizeof buffer);   
+                }          
+            bufferLock.unlock();  
+
+            // Convert buffer to string
+            string buffer_string = "";
+            for(int i = start; i < end; i++)
+            {
+                buffer_string += buffer_copy[i].getData();
+            }
+            return buffer_string;
+        }
+
+        string readLastRecord()
+        {
+            return readBuffer(itemCount, itemCount-1); // Read from penultimate record until the ultimate record
+        }
+
+};
+FIFO_Buffer fifoBuffer;
 
 /* Requirements *
  - Active: 1, 2, 3, 4, 8, 9, 12, 13
@@ -229,19 +276,19 @@ Datetime dateTime;
 
 void changePart() 
 {
-  dt_part = (dt_part < 5) ? dt_part + 1 : 0; // If it's already 5, then set to 0
-  date_changing = dt_part != 0;              // If 0, stop changing
+    if(dt_part == 0) semDateChanging.release(); // Release a semaphore to allow date change
+    dt_part = (dt_part < 5) ? dt_part + 1 : 0; // If it's already 5, then set to 0
+    if(dt_part == 0) logQueue.call(logMessage, "Date/Time set.\n");
 }
 void displayDatetime()
-{
-    // Requirement TODO: lcd_disp.printf()s should be done through the serial communication thread (tSerialComm)
+{    
     while(true)
     {
         lcd_disp.cls();
-        lcd_disp.printf("%04d-%02d-%02d %02d:%02d", dateTime.year, dateTime.month, dateTime.day, dateTime.hour, dateTime.minute); // ISO 8601-compliant
+        lcd_disp.printf("%s", dateTime.getTimestampLCD());
 
         // Indicate being-changed part (why doesn't English have imperfect adjectival verbs?)
-        if(date_changing)
+        if(dt_part != 0)
         {            
             int offset = (dt_part >=2) ? 2 : 1; // Year needs +1 offset; others need +2 offset
 
@@ -249,35 +296,174 @@ void displayDatetime()
             lcd_disp.locate(1, ((dt_part-1) * 3) + offset);
             lcd_disp.printf("^^");
         }
-        
-        ThisThread::sleep_for(1000ms);
+
+        if(dt_part == 0) dateTime.timeInc(); // Increment time only if it's not being changed by user     
+        wait_us(1000000); // Wait 1s
     }
     
 }
-void timeInc()
+
+void getUserInput()
 {
-    // Performance TODO: This will cause quite a bit of overhead. Find a way to call struct function with attach()
-    //  - Otherwise, just keep put the time tracking logic in here, I guess... Maybe keep the data global. Ugly, though
-    dateTime.timeInc();
+    while(true)
+    {
+        printf("\nEnter a command (see Table 2 for details). Press ENTER to finish: \n");
+
+        string command = "", variable = "";
+        char input_char;
+        int i = 0;
+        bool is_variable = false;
+        do
+        {
+            input_char = getchar();
+            printf("%c", input_char);
+
+            if(input_char == 10) 
+                break; // Break BEFORE appending to string
+            else if(input_char == ' ')
+            {
+                is_variable = true; // Switch to variable after space
+                continue;
+            }
+
+            // Before space, command. After space, variable.
+            if(!is_variable) 
+                command += input_char;
+            else 
+                variable += input_char;
+        }
+        while(i < 32);
+
+        logQueue.call(logMessage, "Command received "+command+" "+variable);
+
+        if(command == "READ")
+        {
+            if(variable == "NOW")
+            {
+                // Reads back the current (latest) record in the FIFO (date, time, temperature, pressure, light)
+                printf("%s", fifoBuffer.readLastRecord().c_str());
+            }
+        }
+        else if(command == "READBUFFER")
+        {
+            int n = stoi(variable);
+
+            // N < 0: Entire buffer. N > 0: N records. Handled by readBuffer() // TODO: Do through serial thread properly
+            printf("%s", fifoBuffer.readBuffer(n).c_str());
+        }
+        else if(command == "SETT")
+        {            
+            float t = stof(variable);
+            int ms = t*1000;
+
+            if(t >= 0.1f && t <= 30.0f)
+            {
+                // set the sampling period to <T> seconds and will return a string “T UPDATED TO <T>” 
+                
+                sample_rate = (chrono::milliseconds) ms;
+                printf("T UPDATED TO %dms\n", ms); // TODO: Send through serial thread properly
+            }
+            else
+            {
+                // Out of range error
+                logQueue.call(logMessage, "[ERROR] SETT variable out of range.", true);
+            }
+        }
+        else if(command == "STATE")
+        {
+            if(variable == "ON")
+            {
+                // Start sampling
+                semSample.release();
+
+                // Echo confirmation string // TODO: Do this through the thread etc. etc.
+                printf("SAMPLING: ACTIVE\n");
+                
+            }
+            else if(variable == "OFF")
+            {
+                // Stop sampling                
+                semSample.acquire();
+
+                // Echo confirmation string // TODO: Do this through the thread etc. etc.
+                printf("SAMPLING: INACTIVE\n");
+            }
+            else
+            {
+                logQueue.call(logMessage, "[ERROR] STATE variable must be ON or OFF.", true);
+            }
+        }
+        else if(command == "LOGGING")
+        {
+             if(variable == "ON")
+            {
+                // Start sampling
+                loggingEnabled = true;
+
+                // Echo confirmation string // TODO: Do this through the thread etc. etc.
+                printf("LOGGING: ACTIVE\n");
+                
+            }
+            else if(variable == "OFF")
+            {
+                // Stop sampling                
+                loggingEnabled = false;
+
+                // Echo confirmation string // TODO: Do this through the thread etc. etc.
+                printf("LOGGING: INACTIVE\n");
+            }
+            else
+            {
+                logQueue.call(logMessage, "[ERROR] LOGGING variable must be ON or OFF.", true);
+            }
+        }
+        else if(command == "SD")
+        {
+            if(variable == "E")
+            {
+                // Flush AND eject the SD card (unmount)                
+                semWrite.release(); // SD write function will flush buffer
+                tSDWrite.flags_set(1);
+
+                // Echo confirmation string  // TODO: Do this through the thread etc. etc.
+                printf("SD CARD: FLUSHED, EJECTED\n");
+            }
+            else if(variable == "F")
+            {
+                // Flush the SD card
+                semWrite.release(); // SD write function will flush buffer
+
+                // Echo confirmation string  // TODO: Do this through the thread etc. etc.
+                printf("SD CARD: FLUSHED\n");
+            }
+            else
+            {
+                logQueue.call(logMessage, "[ERROR] SD variable must be E or F.", true);
+            }
+        }
+
+        logQueue.call(logMessage, "Command parsed "+command+" "+variable);
+    }
+
+    
+
 }
 
 // Remember that main() runs in its own thread in the OS
 int main()
 {
     /* START REQUIREMENT 1 - Environmental Sensor */
-    // This device shall periodically measure sensor data at a fixed and deterministic rate. 
-    // This shall include temperature (deg C), pressure (mbar) and light levels (from the LDR). 
-    // The default update rate shall be once every second and you should write your code to sampling minimize jitter. 
-    // The data shall be encapsulated in a single C++ structure or class
 
     //Environmental sensor
     bmp280.initialize();
 
     //tDebug.start(debugStuff);
+    tLogging.start(logThread);
     tSample.start(sampleEnvironment);
     tDatetime.start(displayDatetime);
     tDatetimeChange.start(handleDatetimeChange);
-    tSDWrite.start(write_sd); // TODO: If this doesn't work, write_sd() doesn't seem to work when running on a thread
+    tSDWrite.start(write_sd);
+    tSerialComm.start(getUserInput);   
     
 
     /* END Requirement 1 */
@@ -290,12 +476,9 @@ void handleDatetimeChange()
     //          - Making btnB allow the user to go back a part
         
     btnA.rise(&changePart);
-    ticker.attach(&timeInc, 1000ms);
-    while (true) 
+    while(true)
     {
-        if (!date_changing)
-            ThisThread::sleep_for(5000ms); // Check for initiation button press every 5 second
-
+        semDateChanging.acquire();
         if (dt_part == 1) // YEAR
         {
             // Read potentiometer and check if it's been moved up or down since last read
@@ -304,10 +487,8 @@ void handleDatetimeChange()
             if(pot_val > 0.66) direction = 1;
             else if(pot_val < 0.33) direction = -1;
 
-            printf("POT_VAL %f | DIRECTION %d | YEAR %d\n", pot_val, direction, dateTime.year);
-
             if(direction != 0) dateTime.year += direction;
-            ThisThread::sleep_for(1000ms); // TODO: Make sure this can't be interrupted
+            ThisThread::sleep_for(1000ms); // To stop the year from zooming past the Great Collapse of the Universe
         }
         else if (dt_part == 2) // MONTH
         {
@@ -341,115 +522,77 @@ void handleDatetimeChange()
 
             dateTime.minute = 59 * pot_val;
         }
-
-        // TODO: Better yet, stop timeInc from ticking until this operation is complete
-        dateTime.second = 0; // Reset second so it doesn't change the minute outside of user control
     }
 
     /* END Requirement 4 - Set Date/Time */
 }
 
-int write_sd() 
+void write_sd() 
 {    
-    // TODO: Why aren't there any signals, damn it?
-    // TODO: Log the event
-    while(true)
+    if(sd_mine.init() != 0) 
     {
-        if(write_block)
-        {
-            ThisThread::sleep_for(1000ms);
-        }
-        else
-        {
-            write_block = true;
-            string buffer_contents = fifoBuffer.readBuffer(); // TODO: Should be blocking
-
-            printf("Initialise and write to a file\n");
-
-            // call the SDBlockDevice instance initialisation method.
-            if (0 != sd_mine.init()) {
-                printf("Init failed \n");
-                return -1;
-            }
-
-            FATFileSystem fs("sd", &sd_mine);
-            FILE *fp = fopen("/sd/sensor_data.txt", "w");
-
-            if (fp == NULL)
-            {
-                printf("Cannot be opened");
-                // File could not be opened for write
-                sd_mine.deinit();
-                return -1;
-            } 
-            else 
-            {        
-                // TODO: This read should be blocking (will need to figure out the fucking internal class threads, then. Joyous)
-                printf("BRO %s\n", buffer_contents.c_str());
-                fprintf(fp, "%s", buffer_contents.c_str());
-                fclose(fp);
-                return sd_mine.deinit(); // Returns 0
-            } 
-        }
+        logQueue.call(logMessage, "[ERROR] SD mount failed.", true);
+        return;
     }
-}
-
-int read_sd()
-{
-    printf("Initialise and read from a file\n");
-
-    // call the SDBlockDevice instance initialisation method.
-    if (0 != sd_mine.init()) {
-    printf("Init failed \n");
-    return -1;
-    }
-
     FATFileSystem fs("sd", &sd_mine);
-    FILE *fp = fopen("/sd/sensor_data.txt", "r");
-    if (fp == NULL) 
+
+    // TODO: Log the event
+    while(ThisThread::flags_get() == 0) // Flag will be sent to unmount SD card
     {
-        error("Could not open or find file for read\n");
-        sd_mine.deinit();
-        return -1;
-    }
-    else 
-    {
-        // Read the file
-        char buff[64];
-        buff[63] = 0;
-        while (!feof(fp)) 
+        semWrite.acquire(); // Puts into waiting state until semaphore released by another process        
+        string buffer_contents = fifoBuffer.readBuffer(-1, 0, true);   
+
+        FILE *fp = fopen("/sd/sensor_data.txt", "w");
+
+        if (fp == NULL)
         {
-            fgets(buff, 63, fp);
-            printf("%s", buff);
-        }
-        // Tidy up here
-        fclose(fp);
-        return sd_mine.deinit();
+            logQueue.call(logMessage, "[ERROR] File cannot be opened.", true);
+            sd_mine.deinit();
+            return;
+        } 
+        else 
+        {        
+            //printf("WRITTEN:\n %s", buffer_contents.c_str());
+            fprintf(fp, "%s", buffer_contents.c_str());
+            fclose(fp);
+            logQueue.call(logMessage, "Wrote data block to SD card.");
+        } 
     }
+    
+    printf("SD CARD: UNMOUNTED\n");
+    sd_mine.deinit();
+    return;
 }
 
 void sampleEnvironment()
 {
     while(true)
-    {
-        //printf("Collecting sampling data...\n");
+    {        
+        // Wait for sample semaphore (1 available by default; stolen by STATE OFF command)
+        semSample.acquire();
 
-        // Collect sample data
-        sensorData.light_level = ldr;
-        sensorData.temperature = bmp280.getTemperature();
-        sensorData.pressure = bmp280.getPressure();
+            // Collect sample data
+            SensorData sensorData = SensorData(bmp280.getTemperature(), bmp280.getPressure(), ldr);
+            logQueue.call(logMessage, "Sampled data.");
+            
+            
+            fifoBuffer.produce(sensorData);
 
-        // TODO: send data to FIFO buffer (on this thread(?))
-        // TODO: MIght be overhead on to_string() call; if there is jitter, consider correcting this somehow        
-
-        string message = "Temp: "+to_string(sensorData.temperature)+" || Pressure: "+to_string(sensorData.pressure)+" || Light: "+to_string(sensorData.light_level)+"\n";        
-
-        if(message.length() <= 64)
-            fifoBuffer.produce(message);
-        else
-            printf("ERROR: Sample message length too long (%d)!\n", message.length());
-
-        // Wait a second (minus however long it took? Timer would probably cause overhead, though)
-        ThisThread::sleep_for(1000ms);
+        semSample.release();
+        ThisThread::sleep_for(sample_rate);
     }
+}
+
+void logThread()
+{
+    logQueue.dispatch_forever();
+}
+void logMessage(string message, bool isError = false)
+{
+    if(loggingEnabled || isError)
+    {
+        printf("[LOG] %s\n", message.c_str()); // TODO: Do this through the serial thread   
+
+        if(isError) redLED = 1;
+    }       
 }
