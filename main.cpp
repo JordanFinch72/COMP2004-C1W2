@@ -41,6 +41,8 @@ void debugStuff();
 void sampleEnvironment();
 void handleDatetimeChange();
 void write_sd();
+void serialThread();
+void serialMessage(string);
 void logMessage(string, bool);
 void logThread();
 int read_sd();
@@ -57,8 +59,9 @@ Semaphore semWrite;
 Semaphore semSample(1);
 chrono::milliseconds sample_rate = 1000ms;
 Semaphore semLogging(1);
-bool loggingEnabled = false;
+bool loggingEnabled = true;
 EventQueue logQueue;
+EventQueue serialQueue;
 
 Semaphore semDateChanging;
 
@@ -69,7 +72,7 @@ Semaphore semDateChanging;
 //  - (iii) communicating with the serial interface 
 //  - (iv) communicating with the network. 
 //  - Event Queues are recommended but not a requirement. In addition, you may also use interrupts if appropriate and where justified, again with suitable synchronization.
-Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange, tLogging;
+Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange, tInput;
 Thread tDebug; // TODO: Delete before uploading to DLE
 
 // Classes & Structs //
@@ -200,7 +203,7 @@ class FIFO_Buffer
             // If there isn't enough space
             if(freeSpace <= 0)
             {
-                logQueue.call(logMessage, "[ERROR] Buffer full.", true);
+                logMessage("[ERROR] Buffer full.\n", true);
             }
             else
             {
@@ -278,7 +281,7 @@ void changePart()
 {
     if(dt_part == 0) semDateChanging.release(); // Release a semaphore to allow date change
     dt_part = (dt_part < 5) ? dt_part + 1 : 0; // If it's already 5, then set to 0
-    if(dt_part == 0) logQueue.call(logMessage, "Date/Time set.\n");
+    if(dt_part == 0) logMessage("Date/Time set.\n", false);
 }
 void displayDatetime()
 {    
@@ -307,7 +310,7 @@ void getUserInput()
 {
     while(true)
     {
-        printf("\nEnter a command (see Table 2 for details). Press ENTER to finish: \n");
+        serialQueue.call(serialMessage, "\nEnter a command (see Table 2 for details). Press ENTER to finish: \n");
 
         string command = "", variable = "";
         char input_char;
@@ -334,14 +337,15 @@ void getUserInput()
         }
         while(i < 32);
 
-        logQueue.call(logMessage, "Command received "+command+" "+variable);
+        string concatenated = "Command received: " + command + variable + "\n";
+        logMessage(concatenated, false);
 
         if(command == "READ")
         {
             if(variable == "NOW")
             {
                 // Reads back the current (latest) record in the FIFO (date, time, temperature, pressure, light)
-                printf("%s", fifoBuffer.readLastRecord().c_str());
+                serialQueue.call(serialMessage, fifoBuffer.readLastRecord());
             }
         }
         else if(command == "READBUFFER")
@@ -349,7 +353,7 @@ void getUserInput()
             int n = stoi(variable);
 
             // N < 0: Entire buffer. N > 0: N records. Handled by readBuffer() // TODO: Do through serial thread properly
-            printf("%s", fifoBuffer.readBuffer(n).c_str());
+            serialQueue.call(serialMessage, fifoBuffer.readBuffer(n));
         }
         else if(command == "SETT")
         {            
@@ -358,15 +362,17 @@ void getUserInput()
 
             if(t >= 0.1f && t <= 30.0f)
             {
-                // set the sampling period to <T> seconds and will return a string “T UPDATED TO <T>” 
-                
+                // Set the sampling period to <t> seconds and return a string "“"T UPDATED TO <t>ms""
+
                 sample_rate = (chrono::milliseconds) ms;
-                printf("T UPDATED TO %dms\n", ms); // TODO: Send through serial thread properly
+                char* message = (char*) malloc(24 * sizeof(char));
+                sprintf(message, "T UPDATED TO %dms\n", ms);
+                serialQueue.call(serialMessage, message);
             }
             else
             {
                 // Out of range error
-                logQueue.call(logMessage, "[ERROR] SETT variable out of range.", true);
+                logMessage("[ERROR] SETT variable out of range.\n", true);
             }
         }
         else if(command == "STATE")
@@ -376,8 +382,8 @@ void getUserInput()
                 // Start sampling
                 semSample.release();
 
-                // Echo confirmation string // TODO: Do this through the thread etc. etc.
-                printf("SAMPLING: ACTIVE\n");
+                // Echo confirmation string
+                serialQueue.call(serialMessage, "SAMPLING: ACTIVE\n");
                 
             }
             else if(variable == "OFF")
@@ -385,12 +391,12 @@ void getUserInput()
                 // Stop sampling                
                 semSample.acquire();
 
-                // Echo confirmation string // TODO: Do this through the thread etc. etc.
-                printf("SAMPLING: INACTIVE\n");
+                // Echo confirmation string
+                serialQueue.call(serialMessage, "SAMPLING: INACTIVE\n");
             }
             else
             {
-                logQueue.call(logMessage, "[ERROR] STATE variable must be ON or OFF.", true);
+                logMessage("[ERROR] STATE variable must be ON or OFF.\n", true);
             }
         }
         else if(command == "LOGGING")
@@ -400,8 +406,8 @@ void getUserInput()
                 // Start sampling
                 loggingEnabled = true;
 
-                // Echo confirmation string // TODO: Do this through the thread etc. etc.
-                printf("LOGGING: ACTIVE\n");
+                // Echo confirmation string
+                serialQueue.call(serialMessage, "LOGGING: ACTIVE\n");
                 
             }
             else if(variable == "OFF")
@@ -409,12 +415,12 @@ void getUserInput()
                 // Stop sampling                
                 loggingEnabled = false;
 
-                // Echo confirmation string // TODO: Do this through the thread etc. etc.
-                printf("LOGGING: INACTIVE\n");
+                // Echo confirmation string
+                serialQueue.call(serialMessage, "LOGGING: INACTIVE\n");
             }
             else
             {
-                logQueue.call(logMessage, "[ERROR] LOGGING variable must be ON or OFF.", true);
+                logMessage("[ERROR] LOGGING variable must be ON or OFF.\n", true);
             }
         }
         else if(command == "SD")
@@ -422,27 +428,28 @@ void getUserInput()
             if(variable == "E")
             {
                 // Flush AND eject the SD card (unmount)                
-                semWrite.release(); // SD write function will flush buffer
-                tSDWrite.flags_set(1);
+                semWrite.release();     // SD write function will flush buffer
+                tSDWrite.flags_set(1);  // Flag will end write check loop and eject SD card
 
                 // Echo confirmation string  // TODO: Do this through the thread etc. etc.
-                printf("SD CARD: FLUSHED, EJECTED\n");
+                serialQueue.call(serialMessage, "SD CARD: FLUSHED, EJECTED\n");
             }
             else if(variable == "F")
             {
                 // Flush the SD card
                 semWrite.release(); // SD write function will flush buffer
 
-                // Echo confirmation string  // TODO: Do this through the thread etc. etc.
-                printf("SD CARD: FLUSHED\n");
+                // Echo confirmation string
+                serialQueue.call(serialMessage, "SD CARD: FLUSHED\n");
             }
             else
             {
-                logQueue.call(logMessage, "[ERROR] SD variable must be E or F.", true);
+                logMessage("[ERROR] SD variable must be E or F.\n", true);
             }
         }
 
-        logQueue.call(logMessage, "Command parsed "+command+" "+variable);
+        concatenated = "Command parsed: " + command + variable + "\n";
+        logMessage(concatenated, false);
     }
 
     
@@ -458,12 +465,12 @@ int main()
     bmp280.initialize();
 
     //tDebug.start(debugStuff);
-    tLogging.start(logThread);
+    tSerialComm.start(serialThread);
     tSample.start(sampleEnvironment);
     tDatetime.start(displayDatetime);
     tDatetimeChange.start(handleDatetimeChange);
     tSDWrite.start(write_sd);
-    tSerialComm.start(getUserInput);   
+    tInput.start(getUserInput);
     
 
     /* END Requirement 1 */
@@ -531,7 +538,7 @@ void write_sd()
 {    
     if(sd_mine.init() != 0) 
     {
-        logQueue.call(logMessage, "[ERROR] SD mount failed.", true);
+        logMessage("[ERROR] SD mount failed.\n", true);
         return;
     }
     FATFileSystem fs("sd", &sd_mine);
@@ -546,7 +553,7 @@ void write_sd()
 
         if (fp == NULL)
         {
-            logQueue.call(logMessage, "[ERROR] File cannot be opened.", true);
+            logMessage("[ERROR] File cannot be opened.\n", true);
             sd_mine.deinit();
             return;
         } 
@@ -555,11 +562,11 @@ void write_sd()
             //printf("WRITTEN:\n %s", buffer_contents.c_str());
             fprintf(fp, "%s", buffer_contents.c_str());
             fclose(fp);
-            logQueue.call(logMessage, "Wrote data block to SD card.");
+            logMessage("Wrote data block to SD card.\n", false);
         } 
     }
     
-    printf("SD CARD: UNMOUNTED\n");
+    serialQueue.call(serialMessage, "SD CARD: UNMOUNTED\n");
     sd_mine.deinit();
     return;
 }
@@ -573,8 +580,7 @@ void sampleEnvironment()
 
             // Collect sample data
             SensorData sensorData = SensorData(bmp280.getTemperature(), bmp280.getPressure(), ldr);
-            logQueue.call(logMessage, "Sampled data.");
-            
+            logMessage("Sampled data.\n", false);            
             
             fifoBuffer.produce(sensorData);
 
@@ -583,16 +589,20 @@ void sampleEnvironment()
     }
 }
 
-void logThread()
+void serialThread()
 {
-    logQueue.dispatch_forever();
+    serialQueue.dispatch_forever();
 }
-void logMessage(string message, bool isError = false)
+void serialMessage(string message)
+{
+    printf("%s", message.c_str());
+}
+void logMessage(string message, bool isError)
 {
     if(loggingEnabled || isError)
     {
-        printf("[LOG] %s\n", message.c_str()); // TODO: Do this through the serial thread   
-
+        message = "[LOG] " + message;
+        serialQueue.call(serialMessage, message);
         if(isError) redLED = 1;
     }       
 }
