@@ -7,62 +7,50 @@
 #include "SDBlockDevice.h"
 #include "FATFileSystem.h"
 
-#define BUFFER_SIZE       16
-#define CONSUME_THRESHOLD 12  // Consume once 75% full (12 samples) to mitigate/prevent buffer full error
+#define BUFFER_SIZE         2000 // After an hour, maximum 1,800 records will be flushed. See "SETT" for details.
+#define CONSUME_MAX_SECONDS 60   // Max. 1 SD write every 60 seconds
 
 using namespace uop_msb_200;
 using namespace std;
 
-//Digital Inputs (you could use DigitalIn or InterruptIn instead)
-Buttons btns;
-InterruptIn btnA(BTN1_PIN);
-
-//Analogue Inputs
+// Environmental inputs
+BMP280_SPI bmp280(PB_5, PB_4, PB_3, PB_2);
 AnalogIn ldr(AN_LDR_PIN);
 
-// Potentiometer
-AnalogIn pot(PA_0);
+// User control inputs
+Buttons btns;
+InterruptIn btnA(BTN1_PIN);
+AnalogIn potentiometer(PA_0);
 
-//LED Outputs
+// Outputs
+LCD_16X2_DISPLAY lcdDisplay;
 DigitalOut redLED(TRAF_RED1_PIN);
-
-//Buzzer
-Buzzer buzz;
-
-//LCD Display
-LCD_16X2_DISPLAY lcd_disp;
 
 // Ticker
 Ticker ticker;
 
 // Functions //
 // TODO: Make sure they're all here
-void debugStuff();
-void sampleEnvironment();
+void changePart();
+void displayDatetime();
+void getUserInput();
 void handleDatetimeChange();
-void write_sd();
+void sdWrite();
+void sampleEnvironment();
 void serialThread();
 void serialMessage(string);
 void logMessage(string, bool);
-void logThread();
-int read_sd();
-
-BMP280_SPI bmp280(PB_5, PB_4, PB_3, PB_2);
 
 // SD Card
-static SDBlockDevice sd_mine(PB_5, PB_4, PB_3, PF_3); // SD Card Block Device
-static InterruptIn sd_inserted(PF_4); // Interrupt for card insertion events // TODO: If SD card hasn't been inserted, this should switch a boolean to let SD writes happen
+static SDBlockDevice sdBlockDevice(PB_5, PB_4, PB_3, PF_3); // SD Card Block Device
+static InterruptIn sdInserted(PF_4); // Interrupt for card insertion events // TODO: If SD card hasn't been inserted, this should switch a boolean to let SD writes happen
 
 // Globals
-int dt_part = 0; // Date/Time Set Part [0: wait, 1: day, 2: month, 3: year, 4: hour, 5: minute, 6: second]. Not enum because can't ++dt_part if enum
+bool loggingEnabled = false; // Switched by user-input command to enable/disable logging
 Semaphore semWrite;
 Semaphore semSample(1);
-chrono::milliseconds sample_rate = 1000ms;
-Semaphore semLogging(1);
-bool loggingEnabled = true;
-EventQueue logQueue;
+chrono::milliseconds sampleRate = 1000ms;
 EventQueue serialQueue;
-
 Semaphore semDateChanging;
 
 // Threads //
@@ -73,28 +61,26 @@ Semaphore semDateChanging;
 //  - (iv) communicating with the network. 
 //  - Event Queues are recommended but not a requirement. In addition, you may also use interrupts if appropriate and where justified, again with suitable synchronization.
 Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange, tInput;
-Thread tDebug; // TODO: Delete before uploading to DLE
 
 // Classes & Structs //
 struct SensorData
 {
-    // TODO: Data types probably incorrect
     float temperature;
     float pressure;
-    float light_level;
+    float lightLevel;
 
     SensorData(){}
     SensorData(float temp, float pres, float light)
     {
         temperature = temp;
         pressure = pres;
-        light_level = light;
+        lightLevel = light;
     }
 
     char* getData()
     {
         char* data = (char*) malloc(64 * sizeof(char));
-        sprintf(data, "Temp: %.2fC | Pressure: %.2fmBar | Light: %.4fV", this->temperature, this->pressure, this->light_level);
+        sprintf(data, "Temp: %.2fC | Pressure: %.2fmBar | Light: %.4fV", this->temperature, this->pressure, this->lightLevel);
         return data;
     }
 };
@@ -107,6 +93,9 @@ struct Datetime
     unsigned short hour;
     unsigned short minute;
     unsigned short second;
+    unsigned short changePart = 0; // Part of datetime being modified by user
+                                   // [0: wait, 1: day, 2: month, 3: year, 4: hour, 5: // minute, 6: second]. 
+                                   //   - Not enum because can't ++dtPart etc. if enum (makes code clunky and gross)
 
     char* getTimestamp()
     {
@@ -163,7 +152,7 @@ struct Datetime
 };
 Datetime dateTime;
 
-class FIFO_Buffer
+class FIFOBuffer
 {
     // TODO: Use C++ templates for higher marks
     // TODO: Use RTOS APIs to make it thread-safe
@@ -184,7 +173,7 @@ class FIFO_Buffer
 
         char* getData()
         {
-            char* data = (char*) malloc(128 * sizeof(char));
+            char* data = (char*) malloc(75 * sizeof(char)); // Max string size: 75 chars
             sprintf(data, "[%s] %s\n", this->dateTime.getTimestamp(), this->sensorData.getData());
             return data;
         }
@@ -192,9 +181,9 @@ class FIFO_Buffer
 
     public:
         BufferData buffer[BUFFER_SIZE]; // No need to dynamically expand: buffer is to buffer SD writes, not memory
-        Thread tProducer, tConsumer; // Can't start threads inside a class?
+        unsigned short consumeThreshold = CONSUME_MAX_SECONDS; // Default sample rate 1s = 60 records before a minute passes (see SETT for details)
     private:
-        int itemCount = 0, freeSpace = BUFFER_SIZE; // TODO: Convert these to semaphores...
+        int itemCount = 0, freeSpace = BUFFER_SIZE;
         Mutex bufferLock;
 
     public:    
@@ -203,7 +192,7 @@ class FIFO_Buffer
             // If there isn't enough space
             if(freeSpace <= 0)
             {
-                logMessage("[ERROR] Buffer full.\n", true);
+                logMessage("[ERROR] Buffer full.\n", true);                
             }
             else
             {
@@ -217,7 +206,7 @@ class FIFO_Buffer
                 bufferLock.unlock();
 
                 // Also, call to consume if threshold reached
-                if(itemCount >= CONSUME_THRESHOLD)
+                if(itemCount >= consumeThreshold)
                 {                    
                     consume();
                 }
@@ -238,10 +227,16 @@ class FIFO_Buffer
 
             /* END Requirement 2 - SD Card Writing */
         }
-
-        // TODO: This should block produce(). Use a Mutex, I guess. Or a lock or something.
+        
         string readBuffer(int end, int start = 0, bool flush = false)
         {            
+            // Lock buffer
+            // Check size of buffer
+            // If size of buffer exceeds memory limit, cap END to memory limit
+            // Return string up to memory limit (<X> amount of records)
+            // Inside sdWrite(), fprintf(readBuffer) will be inside a loop that only ends when the size of the contents isn't max (or something better))
+            // If the size of buffer doesn't exceed memory limit (i.e. on the last call) then unlock buffer
+
             bufferLock.lock();
                 BufferData buffer_copy[BUFFER_SIZE];            // Make a copy of buffer
                 memcpy(buffer_copy, buffer, sizeof(buffer));
@@ -249,9 +244,9 @@ class FIFO_Buffer
                 // Clear the buffer
                 if(flush)
                 {
+                    memset(buffer, 0, sizeof(buffer));
                     freeSpace = BUFFER_SIZE;                       
                     itemCount = 0;
-                    memset(buffer, 0, sizeof buffer);   
                 }          
             bufferLock.unlock();  
 
@@ -270,7 +265,7 @@ class FIFO_Buffer
         }
 
 };
-FIFO_Buffer fifoBuffer;
+FIFOBuffer fifoBuffer;
 
 /* Requirements *
  - Active: 1, 2, 3, 4, 8, 9, 12, 13
@@ -279,31 +274,30 @@ FIFO_Buffer fifoBuffer;
 
 void changePart() 
 {
-    if(dt_part == 0) semDateChanging.release(); // Release a semaphore to allow date change
-    dt_part = (dt_part < 5) ? dt_part + 1 : 0; // If it's already 5, then set to 0
-    if(dt_part == 0) logMessage("Date/Time set.\n", false);
+  if (dateTime.changePart == 0) semDateChanging.release(); // Release a semaphore to allow date change
+  dateTime.changePart = (dateTime.changePart < 5) ? dateTime.changePart + 1 : 0; // If it's already 5, then set to 0
+  if (dateTime.changePart == 0) logMessage("Date/Time set.\n", false);
 }
 void displayDatetime()
 {    
     while(true)
     {
-        lcd_disp.cls();
-        lcd_disp.printf("%s", dateTime.getTimestampLCD());
+        lcdDisplay.cls();
+        lcdDisplay.printf("%s", dateTime.getTimestampLCD());
 
         // Indicate being-changed part (why doesn't English have imperfect adjectival verbs?)
-        if(dt_part != 0)
-        {            
-            int offset = (dt_part >=2) ? 2 : 1; // Year needs +1 offset; others need +2 offset
+        if (dateTime.changePart != 0) 
+        {
+            int offset = (dateTime.changePart >= 2) ? 2 : 1; // Year needs +1 offset; others need +2 offset
 
             // Indicate which datetime part is being changed
-            lcd_disp.locate(1, ((dt_part-1) * 3) + offset);
-            lcd_disp.printf("^^");
+            lcdDisplay.locate(1, ((dateTime.changePart - 1) * 3) + offset);
+            lcdDisplay.printf("^^");
         }
 
-        if(dt_part == 0) dateTime.timeInc(); // Increment time only if it's not being changed by user     
+        if (dateTime.changePart == 0) dateTime.timeInc(); // Increment time only if it's not being changed by user
         wait_us(1000000); // Wait 1s
-    }
-    
+    }    
 }
 
 void getUserInput()
@@ -352,7 +346,7 @@ void getUserInput()
         {
             int n = stoi(variable);
 
-            // N < 0: Entire buffer. N > 0: N records. Handled by readBuffer() // TODO: Do through serial thread properly
+            // N < 0: Entire buffer. N > 0: N records. Handled by readBuffer()
             serialQueue.call(serialMessage, fifoBuffer.readBuffer(n));
         }
         else if(command == "SETT")
@@ -362,9 +356,18 @@ void getUserInput()
 
             if(t >= 0.1f && t <= 30.0f)
             {
-                // Set the sampling period to <t> seconds and return a string "“"T UPDATED TO <t>ms""
+                // Update buffer consume threshold to compensate for time constraints (min. once per hour, max. once per minute) 
+                // This code segment attempts to balance the fact that write should be as infrequent as possible, but also there's a limit on buffer memory (and board memory, for that matter)                
+                unsigned short newThreshold;
+                if(t <= 1)
+                    newThreshold = CONSUME_MAX_SECONDS / t; // Flush buffer once a minute (e.g. 60/0.1 = 600 records before a MINUTE passes; 60/0.2 = 300; 60/0.9 = 67; 60/1 = 60)
+                else if(t > 1)
+                    newThreshold = CONSUME_MAX_SECONDS * (CONSUME_MAX_SECONDS/t); // Flush buffer once an hour (e.g. 2s = (60*(60/2)) = 1,800 records before an HOUR passes; 30s = (60*(60/30)) = 120 records before an HOUR passes)
 
-                sample_rate = (chrono::milliseconds) ms;
+                fifoBuffer.consumeThreshold = newThreshold;
+                    
+                // Set the sampling period to <t> seconds (<ms> millseconds), print string to console
+                sampleRate = (chrono::milliseconds) ms;
                 char* message = (char*) malloc(24 * sizeof(char));
                 sprintf(message, "T UPDATED TO %dms\n", ms);
                 serialQueue.call(serialMessage, message);
@@ -431,7 +434,7 @@ void getUserInput()
                 semWrite.release();     // SD write function will flush buffer
                 tSDWrite.flags_set(1);  // Flag will end write check loop and eject SD card
 
-                // Echo confirmation string  // TODO: Do this through the thread etc. etc.
+                // Echo confirmation string
                 serialQueue.call(serialMessage, "SD CARD: FLUSHED, EJECTED\n");
             }
             else if(variable == "F")
@@ -456,26 +459,6 @@ void getUserInput()
 
 }
 
-// Remember that main() runs in its own thread in the OS
-int main()
-{
-    /* START REQUIREMENT 1 - Environmental Sensor */
-
-    //Environmental sensor
-    bmp280.initialize();
-
-    //tDebug.start(debugStuff);
-    tSerialComm.start(serialThread);
-    tSample.start(sampleEnvironment);
-    tDatetime.start(displayDatetime);
-    tDatetimeChange.start(handleDatetimeChange);
-    tSDWrite.start(write_sd);
-    tInput.start(getUserInput);
-    
-
-    /* END Requirement 1 */
-}
-
 void handleDatetimeChange()
 {
     /* START Requirement 4 - Set Date/Time */
@@ -486,88 +469,93 @@ void handleDatetimeChange()
     while(true)
     {
         semDateChanging.acquire();
-        if (dt_part == 1) // YEAR
+        if (dateTime.changePart == 1) // YEAR
         {
-            // Read potentiometer and check if it's been moved up or down since last read
-            float pot_val = pot.read();
-            int direction = 0; // 0 == stable
-            if(pot_val > 0.66) direction = 1;
-            else if(pot_val < 0.33) direction = -1;
+          // Read potentiometer and check if it's been moved up or down since
+          // last read
+          float pot_val = potentiometer.read();
+          int direction = 0; // 0 == stable
+          if (pot_val > 0.66)
+            direction = 1;
+          else if (pot_val < 0.33)
+            direction = -1;
 
-            if(direction != 0) dateTime.year += direction;
-            ThisThread::sleep_for(1000ms); // To stop the year from zooming past the Great Collapse of the Universe
-        }
-        else if (dt_part == 2) // MONTH
+          if (direction != 0)
+            dateTime.year += direction;
+          ThisThread::sleep_for(1000ms); // To stop the year from zooming past
+                                         // the Heat Death of the Universe
+        } else if (dateTime.changePart == 2)          // MONTH
         {
-            float pot_val = pot.read();
+          float pot_val = potentiometer.read();
 
-            dateTime.month = 12 * pot_val;
-            if (dateTime.month == 0) dateTime.month = 1;
-        }
-        else if (dt_part == 3) // DAY
+          dateTime.month = 12 * pot_val;
+          if (dateTime.month == 0)
+            dateTime.month = 1; // Minimum allowed month
+        } else if (dateTime.changePart == 3) // DAY
         {
-            float pot_val = pot.read(); // Percentage of max value for day
+          float pot_val =
+              potentiometer.read(); // Percentage of max value for day
 
-            if (dateTime.month == 4 || dateTime.month == 6 || dateTime.month == 9 || dateTime.month == 11)
-                dateTime.day = 30 * pot_val;
-            else if (dateTime.month == 2) // Ah, February... the ultimate edge case.
-                dateTime.day = 28 * pot_val;
-            else
-                dateTime.day = 31 * pot_val;
-            if (dateTime.day == 0)
-                dateTime.day = 1; // Minimum allowed day
-        }
-        else if (dt_part == 4) // HOUR
+          if (dateTime.month == 4 || dateTime.month == 6 ||
+              dateTime.month == 9 || dateTime.month == 11)
+            dateTime.day = 30 * pot_val;
+          else if (dateTime.month ==
+                   2) // Ah, February... the ultimate edge case.
+            dateTime.day = 28 * pot_val;
+          else
+            dateTime.day = 31 * pot_val;
+
+          if (dateTime.day == 0)
+            dateTime.day = 1;   // Minimum allowed day
+        } else if (dateTime.changePart == 4) // HOUR
         {
-            float pot_val = pot.read();
+          float pot_val = potentiometer.read();
 
-            dateTime.hour = 23 * pot_val; // Between 00:00 and 23:00, so slightly different than other percentile calculations
-        }
-        else if (dt_part == 5) // MINUTE
+          dateTime.hour =
+              23 * pot_val; // Between 00:00 and 23:00, so slightly different
+                            // than other percentile calculations
+        } else if (dateTime.changePart == 5) // MINUTE
         {
-            float pot_val = pot.read();
+          float pot_val = potentiometer.read();
 
-            dateTime.minute = 59 * pot_val;
+          dateTime.minute = 59 * pot_val;
         }
     }
 
     /* END Requirement 4 - Set Date/Time */
 }
 
-void write_sd() 
-{    
-    if(sd_mine.init() != 0) 
+void sdWrite() 
+{
+    if (sdBlockDevice.init() != 0) 
     {
         logMessage("[ERROR] SD mount failed.\n", true);
         return;
     }
-    FATFileSystem fs("sd", &sd_mine);
 
-    // TODO: Log the event
-    while(ThisThread::flags_get() == 0) // Flag will be sent to unmount SD card
+    FATFileSystem fs("sd", &sdBlockDevice);
+    FILE* fp = fopen("/sd/data.txt", "w");    
+    if(fp == NULL) 
     {
+        logMessage("[ERROR] File cannot be opened.\n", true);
+        sdBlockDevice.deinit();
+        return;
+    }    
+
+    while (ThisThread::flags_get() == 0) // Flag will be sent to unmount SD card
+    {
+
         semWrite.acquire(); // Puts into waiting state until semaphore released by another process        
-        string buffer_contents = fifoBuffer.readBuffer(-1, 0, true);   
-
-        FILE *fp = fopen("/sd/sensor_data.txt", "w");
-
-        if (fp == NULL)
-        {
-            logMessage("[ERROR] File cannot be opened.\n", true);
-            sd_mine.deinit();
-            return;
-        } 
-        else 
-        {        
-            //printf("WRITTEN:\n %s", buffer_contents.c_str());
-            fprintf(fp, "%s", buffer_contents.c_str());
-            fclose(fp);
-            logMessage("Wrote data block to SD card.\n", false);
-        } 
+        string buffer_contents = fifoBuffer.readBuffer(-1, 0, true);
+        
+        // printf("WRITTEN:\n %s", buffer_contents.c_str());
+        fprintf(fp, "%s", buffer_contents.c_str());
+        logMessage("Wrote data block to SD card.\n", false); 
     }
-    
+
+    fclose(fp);    
+    sdBlockDevice.deinit();
     serialQueue.call(serialMessage, "SD CARD: UNMOUNTED\n");
-    sd_mine.deinit();
     return;
 }
 
@@ -585,7 +573,7 @@ void sampleEnvironment()
             fifoBuffer.produce(sensorData);
 
         semSample.release();
-        ThisThread::sleep_for(sample_rate);
+        ThisThread::sleep_for(sampleRate);
     }
 }
 
@@ -599,10 +587,31 @@ void serialMessage(string message)
 }
 void logMessage(string message, bool isError)
 {
-    if(loggingEnabled || isError)
+    if(isError)
+    {
+        error("%s", message.c_str());
+        redLED = 1;
+    } 
+    else if(loggingEnabled)
     {
         message = "[LOG] " + message;
         serialQueue.call(serialMessage, message);
-        if(isError) redLED = 1;
     }       
+}
+
+int main()
+{
+    /* START REQUIREMENT 1 - Environmental Sensor */
+
+    //Environmental sensor
+    bmp280.initialize();
+
+    tSerialComm.start(serialThread);    
+    tSample.start(sampleEnvironment);
+    tDatetime.start(displayDatetime);
+    tDatetimeChange.start(handleDatetimeChange);
+    tSDWrite.start(sdWrite);
+    tInput.start(getUserInput);    
+
+    /* END Requirement 1 */
 }
