@@ -79,7 +79,7 @@ struct SensorData
 
     char* getData()
     {
-        char* data = (char*) malloc(64 * sizeof(char));
+        char* data = (char*) malloc(53 * sizeof(char));
         sprintf(data, "Temp: %.2fC | Pressure: %.2fmBar | Light: %.4fV", this->temperature, this->pressure, this->lightLevel);
         return data;
     }
@@ -99,7 +99,7 @@ struct Datetime
 
     char* getTimestamp()
     {
-        char* timestamp = (char*) malloc(20 * sizeof(char));
+        char* timestamp = (char*) malloc(19 * sizeof(char));
         sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:%02d", this->year, this->month, this->day, this->hour, this->minute, this->second); // ISO 8601-compliant
         return timestamp;
     }
@@ -154,11 +154,6 @@ Datetime dateTime;
 
 class FIFOBuffer
 {
-    // TODO: Use C++ templates for higher marks
-    // TODO: Use RTOS APIs to make it thread-safe
-    // TODO: All thread synchronization should be handled by the class member functions
-    //  - However that doesn't seem bloody possible.
-
     struct BufferData
     {
         Datetime dateTime;
@@ -173,7 +168,7 @@ class FIFOBuffer
 
         char* getData()
         {
-            char* data = (char*) malloc(75 * sizeof(char)); // Max string size: 75 chars
+            char* data = (char*) malloc(76 * sizeof(char)); // Max string size: 76 chars (53 + 19 + 4)
             sprintf(data, "[%s] %s\n", this->dateTime.getTimestamp(), this->sensorData.getData());
             return data;
         }
@@ -356,6 +351,7 @@ void getUserInput()
 
             if(t >= 0.1f && t <= 30.0f)
             {
+                // TODO: Could change the range from "every 6 minutes"/"every 30 minutes" by setting buffer size to 3600 and multiplying <=1 new threshold by 6 and >1 by 2
                 // Update buffer consume threshold to compensate for time constraints (min. once per hour, max. once per minute) 
                 // This code segment attempts to balance the fact that write should be as infrequent as possible, but also there's a limit on buffer memory (and board memory, for that matter)                
                 unsigned short newThreshold;
@@ -568,7 +564,7 @@ void sampleEnvironment()
 
             // Collect sample data
             SensorData sensorData = SensorData(bmp280.getTemperature(), bmp280.getPressure(), ldr);
-            logMessage("Sampled data.\n", false);            
+            //logMessage("Sampled data.\n", false); // TODO: Uncomment this
             
             fifoBuffer.produce(sensorData);
 
@@ -603,9 +599,13 @@ int main()
 {
     /* START REQUIREMENT 1 - Environmental Sensor */
 
+    // Reset LEDs
+    redLED = 0;
+
     //Environmental sensor
     bmp280.initialize();
-
+    
+    // Start threads
     tSerialComm.start(serialThread);    
     tSample.start(sampleEnvironment);
     tDatetime.start(displayDatetime);
