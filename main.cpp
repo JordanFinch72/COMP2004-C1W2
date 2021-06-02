@@ -23,6 +23,7 @@ Buttons btns;
 InterruptIn btnA(BTN1_PIN);
 AnalogIn potentiometer(PA_0);
 
+
 // Outputs
 LCD_16X2_DISPLAY lcdDisplay;
 DigitalOut redLED(TRAF_RED1_PIN);
@@ -51,7 +52,7 @@ static InterruptIn sdInserted(PF_4); // Interrupt for card insertion events // T
 bool loggingEnabled = false; // Switched by user-input command to enable/disable logging
 Semaphore semWrite;
 Semaphore semSample(1);
-chrono::milliseconds sampleRate = 1000ms;
+unsigned short sampleRate = 1000;
 EventQueue serialQueue;
 Semaphore semDateChanging;
 
@@ -63,6 +64,7 @@ Semaphore semDateChanging;
 //  - (iv) communicating with the network. 
 //  - Event Queues are recommended but not a requirement. In addition, you may also use interrupts if appropriate and where justified, again with suitable synchronization.
 Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange, tInput;
+osThreadId_t tDatetimeChangeId;
 
 // Classes & Structs //
 struct SensorData
@@ -202,9 +204,9 @@ class FIFOBuffer
                     buffer[itemCount++] = BufferData(dateTime, sensorData);
                     --freeSpace;
                 bufferLock.unlock();
-                //printf("%s", buffer[itemCount-1].getData());
-                //printf("Space: %d\n", freeSpace);
-                //printf("Count: %d\n", itemCount);
+                //REPORT: printf("%s", buffer[itemCount-1].getData().c_str());
+                //REPORT: printf("Space: %d\n", freeSpace);
+                //REPORT: printf("Count: %d\n", itemCount);
 
                 // Also, call to consume if threshold reached
                 if(itemCount >= consumeThreshold)
@@ -219,7 +221,7 @@ class FIFOBuffer
         // The "read" operation (should be blocking)
         void consume()
         {        
-            //printf("CONSUMING...\n"); 
+            //REPORT: printf("CONSUMING...\n"); 
 
             /* START Requirement 2 - SD Card Writing */
 
@@ -231,7 +233,7 @@ class FIFOBuffer
         
         string readBuffer(int end, int start, bool flush)
         {            
-            printf("Reading from buffer...\n");
+            //REPORT: printf("Locking buffer...\n");
 
             bufferLock.lock();
                 BufferData* buffer_copy = new BufferData[itemCount];
@@ -249,11 +251,10 @@ class FIFOBuffer
                 }          
             bufferLock.unlock();  
 
-            printf("Building buffer string...\n");
+            //REPORT: printf("Building buffer string...\n");
 
             // Convert buffer to string
-            string buffer_string = "";
-            printf("END: %d\n", end);
+            string buffer_string = "";            
             int i = 0;
             for(i = start; i < end; ++i)
             {
@@ -279,10 +280,9 @@ FIFOBuffer fifoBuffer;
 */
 
 void changePart() 
-{
-  if (dateTime.changePart == 0) semDateChanging.release(); // Release a semaphore to allow date change
-  dateTime.changePart = (dateTime.changePart < 5) ? dateTime.changePart + 1 : 0; // If it's already 5, then set to 0
-  if (dateTime.changePart == 0) logMessage("Date/Time set.\n", false);
+{    
+    if (dateTime.changePart != 5) osSignalSet(tDatetimeChangeId, 1);
+    dateTime.changePart = (dateTime.changePart < 5) ? dateTime.changePart + 1 : 0; // If it's already 5, then set to 0      
 }
 void displayDatetime()
 {    
@@ -360,7 +360,6 @@ void getUserInput()
         else if(command == "SETT")
         {            
             float t = stof(variable);
-            int ms = t*1000;
 
             if(t >= 0.1f && t <= 30.0f)
             {                
@@ -377,8 +376,8 @@ void getUserInput()
                 */
                     
                 // Set the sampling period to <t> seconds (<ms> millseconds), print string to console
-                sampleRate = (chrono::milliseconds) ms;
-                string message = "T UPDATED TO " + to_string(ms) + "ms";
+                sampleRate = t*1000;
+                string message = "T UPDATED TO " + to_string(sampleRate) + "ms";
                 serialQueue.call(serialMessage, message);
             }
             else
@@ -467,15 +466,16 @@ void getUserInput()
 
 void handleDatetimeChange()
 {
-    /* START Requirement 4 - Set Date/Time */
-    // TODO: Consider: 
-    //          - Making btnB allow the user to go back a part
-        
+    /* START Requirement 4 - Set Date/Time */    
+
+    tDatetimeChangeId = ThisThread::get_id();        
     btnA.rise(&changePart);
     while(true)
     {
-        semDateChanging.acquire();
-        if (dateTime.changePart == 1) // YEAR
+        //REPORT: printf("Changing part %d...\n", dateTime.changePart);
+        osSignalWait(1, 10000000); // 10,000 seconds I shall wait until called upon by -R-o-h-a-n- the changePart() ISR
+        
+        if(dateTime.changePart == 1) // YEAR
         {
             // Read potentiometer and check if it's been moved up or down since last read
             float pot_val = potentiometer.read();
@@ -486,7 +486,7 @@ void handleDatetimeChange()
                 direction = -1;
 
             if(direction != 0) dateTime.year += direction;
-            ThisThread::sleep_for(1000ms); // To stop the year from zooming past the Heat Death of the Universe
+            wait_us(1000000); // Wait 1s to stop the year from zooming past the Heat Death of the Universe
         } 
         else if(dateTime.changePart == 2)          // MONTH
         {
@@ -546,8 +546,9 @@ void sdWrite()
     while (ThisThread::flags_get() == 0) // Flag will be sent to unmount SD card
     {
         semWrite.acquire(); // Puts into waiting state until semaphore released by another process                
-        string buffer_contents = fifoBuffer.readBuffer(-1, 0, true);
-        printf("Writing to card...");        
+        //REPORT: printf("Writing to card...");        
+        string buffer_contents = fifoBuffer.readBuffer(-1, 0, true);        
+        //REPORT: printf("%s", buffer_contents.c_str());
         fprintf(fp, "%s", buffer_contents.c_str());
         logMessage("Wrote data block to SD card.\n", false); 
     }
@@ -568,12 +569,12 @@ void sampleEnvironment()
 
             // Collect sample data
             SensorData sensorData = SensorData(bmp280.getTemperature(), bmp280.getPressure(), ldr);
-            //logMessage("Sampled data.\n", false); // TODO: Uncomment this
+            logMessage("Sampled data.\n", false); // TODO: Uncomment this
             
             fifoBuffer.produce(sensorData);
 
         semSample.release();
-        ThisThread::sleep_for(sampleRate);
+        wait_us(sampleRate*1000);
     }
 }
 
