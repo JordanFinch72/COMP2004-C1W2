@@ -2,6 +2,7 @@
 #include "uop_msb_2_0_0.h"
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include "BMP280_SPI.h"
 #include "SDBlockDevice.h"
@@ -25,6 +26,7 @@ AnalogIn potentiometer(PA_0);
 // Outputs
 LCD_16X2_DISPLAY lcdDisplay;
 DigitalOut redLED(TRAF_RED1_PIN);
+DigitalOut greenLED(TRAF_GRN1_PIN);
 
 // Ticker
 Ticker ticker;
@@ -166,16 +168,20 @@ class FIFOBuffer
             sensorData = data;
         }
 
-        char* getData()
+        string getData()
         {
-            char* data = (char*) malloc(76 * sizeof(char)); // Max string size: 76 chars (53 + 19 + 4)
-            sprintf(data, "[%s] %s\n", this->dateTime.getTimestamp(), this->sensorData.getData());
+            string data;
+            char* timestamp = this->dateTime.getTimestamp();
+            char* sData = this->sensorData.getData();
+            data = "[" + (string)timestamp + "] " + (string)sData + "\n";
+            free(timestamp);
+            free(sData);
             return data;
         }
     };
 
     public:
-        BufferData buffer[BUFFER_SIZE]; // No need to dynamically expand: buffer is to buffer SD writes, not memory
+        BufferData* buffer = new BufferData[BUFFER_SIZE];      // No need to dynamically expand: buffer is to buffer SD writes, not memory
         unsigned short consumeThreshold = CONSUME_MAX_SECONDS; // Default sample rate 1s = 60 records before a minute passes (see SETT for details)
     private:
         int itemCount = 0, freeSpace = BUFFER_SIZE;
@@ -195,10 +201,10 @@ class FIFOBuffer
                 bufferLock.lock();
                     buffer[itemCount++] = BufferData(dateTime, sensorData);
                     --freeSpace;
-                    //printf("%s", buffer[itemCount-1].getData());
-                    //printf("Space: %d\n", freeSpace);
-                    //printf("Count: %d\n", itemCount);
                 bufferLock.unlock();
+                //printf("%s", buffer[itemCount-1].getData());
+                //printf("Space: %d\n", freeSpace);
+                //printf("Count: %d\n", itemCount);
 
                 // Also, call to consume if threshold reached
                 if(itemCount >= consumeThreshold)
@@ -223,40 +229,45 @@ class FIFOBuffer
             /* END Requirement 2 - SD Card Writing */
         }
         
-        string readBuffer(int end, int start = 0, bool flush = false)
+        string readBuffer(int end, int start, bool flush)
         {            
-            // Lock buffer
-            // Check size of buffer
-            // If size of buffer exceeds memory limit, cap END to memory limit
-            // Return string up to memory limit (<X> amount of records)
-            // Inside sdWrite(), fprintf(readBuffer) will be inside a loop that only ends when the size of the contents isn't max (or something better))
-            // If the size of buffer doesn't exceed memory limit (i.e. on the last call) then unlock buffer
+            printf("Reading from buffer...\n");
 
             bufferLock.lock();
-                BufferData buffer_copy[BUFFER_SIZE];            // Make a copy of buffer
-                memcpy(buffer_copy, buffer, sizeof(buffer));
+                BufferData* buffer_copy = new BufferData[itemCount];
+                memmove(buffer_copy, buffer, itemCount * sizeof(BufferData)); // Copy itemCount items into buffer copy
+
                 if(end < 0 || end > itemCount) end = itemCount; // If READBUFFER -1 or READBUFFER <number_greater_than_itemcount>, return all
+
                 // Clear the buffer
                 if(flush)
                 {
-                    memset(buffer, 0, sizeof(buffer));
+                    delete[] buffer;
+                    buffer = new BufferData[BUFFER_SIZE];
                     freeSpace = BUFFER_SIZE;                       
                     itemCount = 0;
                 }          
             bufferLock.unlock();  
 
+            printf("Building buffer string...\n");
+
             // Convert buffer to string
             string buffer_string = "";
-            for(int i = start; i < end; i++)
+            printf("END: %d\n", end);
+            int i = 0;
+            for(i = start; i < end; ++i)
             {
-                buffer_string += buffer_copy[i].getData();
+                if(flush) greenLED = !greenLED; // Flash green LED when flushing
+                buffer_string += buffer_copy[i].getData(); // TODO: Figure out why this loop can't build a string past 269 iterations
             }
+            delete[] buffer_copy;
+            printf("<%d>\n", i);
             return buffer_string;
         }
 
         string readLastRecord()
         {
-            return readBuffer(itemCount, itemCount-1); // Read from penultimate record until the ultimate record
+            return readBuffer(itemCount, itemCount-1, false); // Read from penultimate record until the ultimate record
         }
 
 };
@@ -278,7 +289,9 @@ void displayDatetime()
     while(true)
     {
         lcdDisplay.cls();
-        lcdDisplay.printf("%s", dateTime.getTimestampLCD());
+        char* timestampLCD = dateTime.getTimestampLCD();
+        lcdDisplay.printf("%s", timestampLCD);
+        free(timestampLCD);
 
         // Indicate being-changed part (why doesn't English have imperfect adjectival verbs?)
         if (dateTime.changePart != 0) 
@@ -310,7 +323,7 @@ void getUserInput()
             input_char = getchar();
             printf("%c", input_char);
 
-            if(input_char == 10) 
+            if(input_char == 10) // ENTER
                 break; // Break BEFORE appending to string
             else if(input_char == ' ')
             {
@@ -324,7 +337,7 @@ void getUserInput()
             else 
                 variable += input_char;
         }
-        while(i < 32);
+        while(i < 16);
 
         string concatenated = "Command received: " + command + variable + "\n";
         logMessage(concatenated, false);
@@ -342,7 +355,7 @@ void getUserInput()
             int n = stoi(variable);
 
             // N < 0: Entire buffer. N > 0: N records. Handled by readBuffer()
-            serialQueue.call(serialMessage, fifoBuffer.readBuffer(n));
+            serialQueue.call(serialMessage, fifoBuffer.readBuffer(n, 0, false));
         }
         else if(command == "SETT")
         {            
@@ -350,10 +363,10 @@ void getUserInput()
             int ms = t*1000;
 
             if(t >= 0.1f && t <= 30.0f)
-            {
-                // TODO: Could change the range from "every 6 minutes"/"every 30 minutes" by setting buffer size to 3600 and multiplying <=1 new threshold by 6 and >1 by 2
+            {                
                 // Update buffer consume threshold to compensate for time constraints (min. once per hour, max. once per minute) 
                 // This code segment attempts to balance the fact that write should be as infrequent as possible, but also there's a limit on buffer memory (and board memory, for that matter)                
+                /* -- This code cannot be implemented due to buffer read loop being unable to iterate more than 269 times -- 
                 unsigned short newThreshold;
                 if(t <= 1)
                     newThreshold = CONSUME_MAX_SECONDS / t; // Flush buffer once a minute (e.g. 60/0.1 = 600 records before a MINUTE passes; 60/0.2 = 300; 60/0.9 = 67; 60/1 = 60)
@@ -361,11 +374,11 @@ void getUserInput()
                     newThreshold = CONSUME_MAX_SECONDS * (CONSUME_MAX_SECONDS/t); // Flush buffer once an hour (e.g. 2s = (60*(60/2)) = 1,800 records before an HOUR passes; 30s = (60*(60/30)) = 120 records before an HOUR passes)
 
                 fifoBuffer.consumeThreshold = newThreshold;
+                */
                     
                 // Set the sampling period to <t> seconds (<ms> millseconds), print string to console
                 sampleRate = (chrono::milliseconds) ms;
-                char* message = (char*) malloc(24 * sizeof(char));
-                sprintf(message, "T UPDATED TO %dms\n", ms);
+                string message = "T UPDATED TO " + to_string(ms) + "ms";
                 serialQueue.call(serialMessage, message);
             }
             else
@@ -402,7 +415,7 @@ void getUserInput()
         {
              if(variable == "ON")
             {
-                // Start sampling
+                // Start logging
                 loggingEnabled = true;
 
                 // Echo confirmation string
@@ -411,7 +424,7 @@ void getUserInput()
             }
             else if(variable == "OFF")
             {
-                // Stop sampling                
+                // Stop logging                
                 loggingEnabled = false;
 
                 // Echo confirmation string
@@ -450,9 +463,6 @@ void getUserInput()
         concatenated = "Command parsed: " + command + variable + "\n";
         logMessage(concatenated, false);
     }
-
-    
-
 }
 
 void handleDatetimeChange()
@@ -467,54 +477,46 @@ void handleDatetimeChange()
         semDateChanging.acquire();
         if (dateTime.changePart == 1) // YEAR
         {
-          // Read potentiometer and check if it's been moved up or down since
-          // last read
-          float pot_val = potentiometer.read();
-          int direction = 0; // 0 == stable
-          if (pot_val > 0.66)
-            direction = 1;
-          else if (pot_val < 0.33)
-            direction = -1;
+            // Read potentiometer and check if it's been moved up or down since last read
+            float pot_val = potentiometer.read();
+            int direction = 0; // 0 == stable
+            if(pot_val > 0.66)
+                direction = 1;
+            else if(pot_val < 0.33)
+                direction = -1;
 
-          if (direction != 0)
-            dateTime.year += direction;
-          ThisThread::sleep_for(1000ms); // To stop the year from zooming past
-                                         // the Heat Death of the Universe
-        } else if (dateTime.changePart == 2)          // MONTH
+            if(direction != 0) dateTime.year += direction;
+            ThisThread::sleep_for(1000ms); // To stop the year from zooming past the Heat Death of the Universe
+        } 
+        else if(dateTime.changePart == 2)          // MONTH
         {
-          float pot_val = potentiometer.read();
+            float pot_val = potentiometer.read();
 
-          dateTime.month = 12 * pot_val;
-          if (dateTime.month == 0)
-            dateTime.month = 1; // Minimum allowed month
-        } else if (dateTime.changePart == 3) // DAY
+            dateTime.month = 12 * pot_val;
+            if(dateTime.month == 0) dateTime.month = 1; // Minimum allowed month
+        } 
+        else if(dateTime.changePart == 3) // DAY
         {
-          float pot_val =
-              potentiometer.read(); // Percentage of max value for day
+            float pot_val = potentiometer.read(); // Percentage of max value for day
 
-          if (dateTime.month == 4 || dateTime.month == 6 ||
-              dateTime.month == 9 || dateTime.month == 11)
-            dateTime.day = 30 * pot_val;
-          else if (dateTime.month ==
-                   2) // Ah, February... the ultimate edge case.
-            dateTime.day = 28 * pot_val;
-          else
-            dateTime.day = 31 * pot_val;
+            if(dateTime.month == 4 || dateTime.month == 6 || dateTime.month == 9 || dateTime.month == 11)
+                dateTime.day = 30 * pot_val;
+            else if(dateTime.month == 2) // Ah, February... the ultimate edge case.
+                dateTime.day = 28 * pot_val;
+            else
+                dateTime.day = 31 * pot_val;
 
-          if (dateTime.day == 0)
-            dateTime.day = 1;   // Minimum allowed day
-        } else if (dateTime.changePart == 4) // HOUR
+            if(dateTime.day == 0) dateTime.day = 1;   // Minimum allowed day
+        } 
+        else if(dateTime.changePart == 4) // HOUR
         {
-          float pot_val = potentiometer.read();
-
-          dateTime.hour =
-              23 * pot_val; // Between 00:00 and 23:00, so slightly different
-                            // than other percentile calculations
-        } else if (dateTime.changePart == 5) // MINUTE
+            float pot_val = potentiometer.read();
+            dateTime.hour = 23 * pot_val; // Between 00:00 and 23:00, so slightly different than other percentile calculations
+        } 
+        else if(dateTime.changePart == 5) // MINUTE
         {
-          float pot_val = potentiometer.read();
-
-          dateTime.minute = 59 * pot_val;
+            float pot_val = potentiometer.read();
+            dateTime.minute = 59 * pot_val;
         }
     }
 
@@ -523,11 +525,14 @@ void handleDatetimeChange()
 
 void sdWrite() 
 {
-    if (sdBlockDevice.init() != 0) 
+    if(sdBlockDevice.init() != 0) 
     {
+         // PLEASE NOTE: This will sporadically fail for no apparent reason. I suspect hardware fault (as supplied SD card also did not work properly)
+         // If this happens during testing, try running it again and it should work.
         logMessage("[ERROR] SD mount failed.\n", true);
         return;
     }
+    greenLED = 1;
 
     FATFileSystem fs("sd", &sdBlockDevice);
     FILE* fp = fopen("/sd/data.txt", "w");    
@@ -540,17 +545,16 @@ void sdWrite()
 
     while (ThisThread::flags_get() == 0) // Flag will be sent to unmount SD card
     {
-
-        semWrite.acquire(); // Puts into waiting state until semaphore released by another process        
+        semWrite.acquire(); // Puts into waiting state until semaphore released by another process                
         string buffer_contents = fifoBuffer.readBuffer(-1, 0, true);
-        
-        // printf("WRITTEN:\n %s", buffer_contents.c_str());
+        printf("Writing to card...");        
         fprintf(fp, "%s", buffer_contents.c_str());
         logMessage("Wrote data block to SD card.\n", false); 
     }
 
     fclose(fp);    
     sdBlockDevice.deinit();
+    greenLED = 0;
     serialQueue.call(serialMessage, "SD CARD: UNMOUNTED\n");
     return;
 }
