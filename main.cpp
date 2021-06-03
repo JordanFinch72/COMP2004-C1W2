@@ -66,7 +66,6 @@ Ticker ticker;
 EthernetInterface ethernetInterface;
 
 // Functions //
-// TODO: Make sure they're all here
 void changePart();
 void displayDatetime();
 void getUserInput();
@@ -238,7 +237,8 @@ class FIFOBuffer
             else
             {
                 // Write to the buffer, update counters
-                bufferLock.lock();
+				bool locked = bufferLock.trylock_for(5000ms);
+				if(!locked)	logMessage("[ERROR] Mutex timeout occurred.\n", true);
                     buffer[itemCount++] = BufferData(dateTime, sensorData);
                     --freeSpace;
                 bufferLock.unlock();
@@ -272,7 +272,16 @@ class FIFOBuffer
         {            
             //REPORT: printf("Locking buffer...\n");
 
-            bufferLock.lock();
+            bool locked = bufferLock.trylock_for(5000ms);
+			if(!locked)	logMessage("[ERROR] Mutex timeout occurred.\n", true);
+
+				// Return "No records" if there are none
+				if(itemCount == 0)
+				{
+					bufferLock.unlock();
+					return "No records";
+				}
+
                 // Create a copy of buffer for expedience
                 BufferData* buffer_copy = new BufferData[itemCount];
                 memmove(buffer_copy, buffer, itemCount * sizeof(BufferData)); // Copy itemCount items into buffer copy
@@ -309,6 +318,13 @@ class FIFOBuffer
         {
             return readBuffer(itemCount, itemCount-1, false); // Read from penultimate record until the ultimate record
         }
+
+		// Locks the mutex to induce a critical timeout error (for demonstration purposes)
+		void errorTest()
+		{
+			bool locked = bufferLock.trylock_for(5000ms);
+			if(!locked)	logMessage("[ERROR] Mutex timeout occurred.\n", true);
+		}
 
 };
 FIFOBuffer fifoBuffer;
@@ -404,20 +420,21 @@ void getUserInput()
 
             if(t >= 0.1f && t <= 30.0f)
             {      
-				// TODO: Uncomment this and see if it works. Otherwise, no worries.
-				// (Will still throw errors after 269 or whatever, so implement it around that, I guess)
-
-                // Update buffer consume threshold to compensate for time constraints (min. once per hour, max. once per minute) 
+				// TODO: Remove this commented code before uploading report
+				// Update buffer consume threshold to compensate for time constraints (min. once per hour, max. once per minute) 
                 // This code segment attempts to balance the fact that write should be as infrequent as possible, but also there's a limit on buffer memory (and board memory, for that matter)                
-                /* -- This code cannot be implemented due to buffer read loop being unable to iterate more than 269 times -- 
+                /* -- This code cannot be implemented due to buffer read loop being unable to iterate more than 269 times without running out of memory -- 
                 unsigned short newThreshold;
                 if(t <= 1)
                     newThreshold = CONSUME_MAX_SECONDS / t; // Flush buffer once a minute (e.g. 60/0.1 = 600 records before a MINUTE passes; 60/0.2 = 300; 60/0.9 = 67; 60/1 = 60)
-                else if(t > 1)
-                    newThreshold = CONSUME_MAX_SECONDS * (CONSUME_MAX_SECONDS/t); // Flush buffer once an hour (e.g. 2s = (60*(60/2)) = 1,800 records before an HOUR passes; 30s = (60*(60/30)) = 120 records before an HOUR passes)
+                else 
+				*/
+				
+				unsigned short newThreshold;
+				if(t > 1)
+                    newThreshold = CONSUME_MAX_SECONDS/t; // Flush buffer once a minute (e.g. 2s = 60/2 = 30 records before a MINUTE passes; 30s = 60/30 = 2 records
 
                 fifoBuffer.consumeThreshold = newThreshold;
-                */
                     
                 // Set the sampling period to <t> seconds (<ms> millseconds), print string to console
                 sampleRate = t*1000;
@@ -427,7 +444,7 @@ void getUserInput()
             else
             {
                 // Out of range error
-                logMessage("[ERROR] SETT variable out of range.\n", true);
+                logMessage("[ERROR] SETT variable out of range.\n", false);
             }
         }
         else if(command == "STATE")
@@ -450,7 +467,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] STATE variable must be ON or OFF.\n", true);
+                logMessage("[ERROR] STATE variable must be ON or OFF.\n", false);
             }
         }
         else if(command == "LOGGING")
@@ -474,7 +491,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] LOGGING variable must be ON or OFF.\n", true);
+                logMessage("[ERROR] LOGGING variable must be ON or OFF.\n", false);
             }
         }
         else if(command == "SD")
@@ -497,9 +514,13 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] SD variable must be E or F.\n", true);
+                logMessage("[ERROR] SD variable must be E or F.\n", false);
             }
         }
+		else if("ERRORTEST")
+		{
+			fifoBuffer.errorTest();
+		}
 
         // Log as per requirement
         concatenated = "Command parsed: " + command + " " + variable + "\n";
