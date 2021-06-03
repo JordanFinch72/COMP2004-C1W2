@@ -427,7 +427,7 @@ void getUserInput()
             else
             {
                 // Out of range error
-                logMessage("[ERROR] SETT variable out of range.\n", false);
+                logMessage("[ERROR] SETT variable out of range.\n", true);
             }
         }
         else if(command == "STATE")
@@ -450,7 +450,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] STATE variable must be ON or OFF.\n", false);
+                logMessage("[ERROR] STATE variable must be ON or OFF.\n", true);
             }
         }
         else if(command == "LOGGING")
@@ -474,7 +474,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] LOGGING variable must be ON or OFF.\n", false);
+                logMessage("[ERROR] LOGGING variable must be ON or OFF.\n", true);
             }
         }
         else if(command == "SD")
@@ -497,7 +497,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] SD variable must be E or F.\n", false);
+                logMessage("[ERROR] SD variable must be E or F.\n", true);
             }
         }
 
@@ -630,7 +630,7 @@ void sdFlushEject()
 	{		
 		osSignalSet(tSDWriteId, 2);		
 		semWrite.release(); // Immediately write to SD card
-   		greenLED = 1;		
+   		greenLED = 1;
 	}
 	else // If mounted, unmount
 	{
