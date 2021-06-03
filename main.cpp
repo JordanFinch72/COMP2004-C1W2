@@ -83,15 +83,15 @@ void refreshServer();
 static SDBlockDevice sdBlockDevice(PB_5, PB_4, PB_3, PF_3); // SD Card Block Device
 
 // Globals
-bool loggingEnabled = false; // Switched by user-input command to enable/disable logging
-Semaphore semWrite;
-Semaphore semSample(1);
-unsigned short sampleRate = 1000;
-EventQueue serialQueue;
-Semaphore semDateChanging;
+bool loggingEnabled = false;		// Switched by user-input command to enable/disable logging
+Semaphore semWrite;			 		// Semaphore released to trigger SD write
+Semaphore semSample(1, 1);	 		// Semaphore released to trigger sampling
+unsigned short sampleRate = 1000;	// Default sample rate of 1000ms
+EventQueue serialQueue;				// For queueing messages to the serial terminal
+Semaphore semDateChanging;			// Semaphore released to trigger date changing
 
 // Threads
-Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange, tButton, tInput;
+Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange, tInput;
 osThreadId_t tDatetimeChangeId, tSDWriteId;
 
 // Classes & Structs //
@@ -407,10 +407,6 @@ void getUserInput()
 				// TODO: Uncomment this and see if it works. Otherwise, no worries.
 				// (Will still throw errors after 269 or whatever, so implement it around that, I guess)
 
-				// TODO: After this, once FULLY tested, test to see if writing to SD with "a" works. If so, do that
-
-				// TODO: Finally, comment every function, etc. better (with @params and shit) and finish the report up
-
                 // Update buffer consume threshold to compensate for time constraints (min. once per hour, max. once per minute) 
                 // This code segment attempts to balance the fact that write should be as infrequent as possible, but also there's a limit on buffer memory (and board memory, for that matter)                
                 /* -- This code cannot be implemented due to buffer read loop being unable to iterate more than 269 times -- 
@@ -431,7 +427,7 @@ void getUserInput()
             else
             {
                 // Out of range error
-                logMessage("[ERROR] SETT variable out of range.\n", true);
+                logMessage("[ERROR] SETT variable out of range.\n", false);
             }
         }
         else if(command == "STATE")
@@ -454,7 +450,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] STATE variable must be ON or OFF.\n", true);
+                logMessage("[ERROR] STATE variable must be ON or OFF.\n", false);
             }
         }
         else if(command == "LOGGING")
@@ -478,7 +474,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] LOGGING variable must be ON or OFF.\n", true);
+                logMessage("[ERROR] LOGGING variable must be ON or OFF.\n", false);
             }
         }
         else if(command == "SD")
@@ -501,7 +497,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] SD variable must be E or F.\n", true);
+                logMessage("[ERROR] SD variable must be E or F.\n", false);
             }
         }
 
@@ -584,8 +580,8 @@ void sdWrite()
 		// Mount the SD card
 		if(sdBlockDevice.init() != 0) 
 		{
-			// PLEASE NOTE: This will sporadically fail for no apparent reason. I suspect hardware fault (as supplied SD card also did not work properly)
-			// If this happens during testing, try running it again and it should work.
+			// PLEASE NOTE: This will sporadically fail for no apparent reason. I suspect hardware fault (as supplied SD card also did not work properly).
+			// If this happens, try running the program again and it should work.
 			logMessage("[ERROR] SD mount failed.\n", true);
 		}
 		else
@@ -596,7 +592,7 @@ void sdWrite()
 
 		// Open the file
 		FATFileSystem fs("sd", &sdBlockDevice);
-		FILE* fp = fopen("/sd/data.txt", "w");    
+		FILE* fp = fopen("/sd/data.txt", "a");    
 		if(fp == NULL) 
 		{
 			logMessage("[ERROR] File cannot be opened.\n", true);
@@ -609,7 +605,7 @@ void sdWrite()
 			semWrite.acquire(); // Puts into waiting state until semaphore released by another process                
 			//REPORT: printf("Writing to card...");        
 			string buffer_contents = fifoBuffer.readBuffer(-1, 0, true);        
-			printf("%s", buffer_contents.c_str());
+			//REPORT: printf("%s", buffer_contents.c_str());
 			fprintf(fp, "%s", buffer_contents.c_str());
 			logMessage("Wrote data block to SD card.\n", false); 
 			greenLED = 1;
@@ -628,10 +624,6 @@ void sdWrite()
 	return;
 }
 
-void buttonThread()
-{
-	btnUser.rise(&sdFlushEject);
-}
 void sdFlushEject()
 {	
 	if(greenLED == 0) // If unmounted, mount
@@ -642,10 +634,10 @@ void sdFlushEject()
 	}
 	else // If mounted, unmount
 	{
-		tSDWrite.flags_set(1);  // Flag will end write check loop and eject SD card
 		semWrite.release();     // SD write function will flush buffer
+		tSDWrite.flags_set(1);  // Flag will end write check loop and eject SD card
 	}
-	wait_us(1000000); // Wait 1s to prevent accidental double-tapping of button
+	wait_us(200000); // Wait 0.2s to prevent accidental double-tapping of button
 }
 
 // Runs on own thread every <sampleRate> milliseconds. 
@@ -680,10 +672,10 @@ void serialMessage(string message)
     printf("%s", message.c_str());
 }
 
-// Formats <message> as a logged message before sending to serialQueue. Triggers error if <isError> is true.
-void logMessage(string message, bool isError)
+// Formats <message> as a logged message before sending to serialQueue. Triggers error if <isCriticalError> is true.
+void logMessage(string message, bool isCriticalError)
 {
-    if(isError)
+    if(isCriticalError)
     {
         redLED = 1;
         error("%s", message.c_str());
@@ -778,6 +770,8 @@ void refreshServer()
 // The main thread
 int main()
 {
+    /* START REQUIREMENT 1 - Environmental Sensor */
+
     // Reset LEDs
     redLED = 0;
     greenLED = 0;
@@ -792,6 +786,7 @@ int main()
     tDatetimeChange.start(handleDatetimeChange);
     tSDWrite.start(sdWrite);
     tNetComm.start(refreshServer);
-	tButton.start(buttonThread);
     tInput.start(getUserInput); 
+
+    btnUser.rise(&sdFlushEject);
 }
