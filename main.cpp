@@ -13,27 +13,27 @@
 // HTML Directives
 #define HTTP_STATUS_LINE "HTTP/1.0 200 OK"
 #define HTTP_HEADER_FIELDS "Content-Type: text/html; charset=utf-8"
-#define HTTP_MESSAGE_BODY ""                                     \
-"<html>" "\r\n"                                                  \
-"  <head><title>Environmental Sensor Readings</title></head>" "\r\n"       \
-"  <body style=\"display: flex; flex-flow: column wrap; align-items: center;\">" "\r\n"       \
-"    <div style=\"display: flex; flex-flow: row wrap; align-items: center;\">" "\r\n"                         \
-"      <h1>Datetime:</h1>" "\r\n"                                \
-"      <p>{{0}}</p>" "\r\n"                                      \
-"    </div>" "\r\n"                                              \
-"    <div style=\"display: flex; flex-flow: row wrap; align-items: center;\">" "\r\n"                         \
-"      <h1>Temperature:</h1>" "\r\n"                                \
-"      <p>{{1}}C</p>" "\r\n"                                      \
-"    </div>" "\r\n"                                              \
-"    <div style=\"display: flex; flex-flow: row wrap; align-items: center;\">" "\r\n"                         \
-"      <h1>Pressure:</h1>" "\r\n"                                \
-"      <p>{{2}}mBar</p>" "\r\n"                                      \
-"    </div>" "\r\n"                                              \
-"    <div style=\"display: flex; flex-flow: row wrap; align-items: center;\">" "\r\n"                         \
-"      <h1>LDR:</h1>" "\r\n"                                \
-"      <p>{{3}}V</p>" "\r\n"                                      \
-"    </div>" "\r\n"                                              \
-"  </body>" "\r\n"                                               \
+#define HTTP_MESSAGE_BODY ""                                                             \
+"<html>" "\r\n"                                                                          \
+"  <head><title>Environmental Sensor Readings</title></head>" "\r\n"                     \
+"  <body style=\"display: flex; flex-flow: column wrap; align-items: center;\">" "\r\n"  \
+"    <div style=\"display: flex; flex-flow: row wrap; align-items: center;\">" "\r\n"    \
+"      <h1>Datetime:</h1>" "\r\n"                                                        \
+"      <p>{{0}}</p>" "\r\n"                                                              \
+"    </div>" "\r\n"                                                                      \
+"    <div style=\"display: flex; flex-flow: row wrap; align-items: center;\">" "\r\n"    \
+"      <h1>Temperature:</h1>" "\r\n"                                                     \
+"      <p>{{1}}C</p>" "\r\n"                                                             \
+"    </div>" "\r\n"                                                                      \
+"    <div style=\"display: flex; flex-flow: row wrap; align-items: center;\">" "\r\n"    \
+"      <h1>Pressure:</h1>" "\r\n"                                                        \
+"      <p>{{2}}mBar</p>" "\r\n"                                                          \
+"    </div>" "\r\n"                                                                      \
+"    <div style=\"display: flex; flex-flow: row wrap; align-items: center;\">" "\r\n"    \
+"      <h1>LDR:</h1>" "\r\n"                                                             \
+"      <p>{{3}}V</p>" "\r\n"                                                             \
+"    </div>" "\r\n"                                                                      \
+"  </body>" "\r\n"                                                                       \
 "</html>" "\r\n"
     
 #define HTTP_TEMPLATE HTTP_STATUS_LINE "\r\n"   \
@@ -41,17 +41,17 @@
                       "\r\n"                    \
                       HTTP_MESSAGE_BODY "\r\n"
 
-#define BUFFER_SIZE         2000 // After an hour, maximum 1,800 records will be flushed. See "SETT" for details.
-#define CONSUME_MAX_SECONDS 60   // Max. 1 SD write every 60 seconds
+#define BUFFER_SIZE         120 
+#define CONSUME_MAX_SECONDS 60   // Max. 1 SD write every 60 seconds (see getUserInput()->"SETT" for more details)
 
 using namespace uop_msb_200;
 using namespace std;
 
-// Environmental inputs
+// Environmental Inputs
 BMP280_SPI bmp280(PB_5, PB_4, PB_3, PB_2);
 AnalogIn ldr(AN_LDR_PIN);
 
-// User control inputs
+// User Control Inputs
 InterruptIn btnA(BTN1_PIN);
 InterruptIn btnUser(USER_BUTTON);
 AnalogIn potentiometer(PA_0);
@@ -66,20 +66,20 @@ Ticker ticker;
 EthernetInterface ethernetInterface;
 
 // Functions //
-void changePart();
-void displayDatetime();
-void getUserInput();
-void handleDatetimeChange();
-void sdWrite();
-void sdFlushEject();
-void sampleEnvironment();
-void serialThread();
-void serialMessage(string);
-void logMessage(string, bool);
-void refreshServer();
+void sampleEnvironment();       // Requirement 1
+void sdWrite();                 // Requirement 2 & 3
+void changePart();              // Requirement 4
+void handleDatetimeChange();    // Requirement 4
+void displayDatetime();         // Requirement 4
+void serialThread();            // Requirement 6
+void serialMessage(string);     // Requirement 6
+void getUserInput();            // Requirement 8
+void refreshServer();           // Requirement 9
+void logMessage(string, bool);  // Requirement 12
+void sdMountToggle();           // Requirement 13
 
 // SD Card
-static SDBlockDevice sdBlockDevice(PB_5, PB_4, PB_3, PF_3); // SD Card Block Device
+static SDBlockDevice sdBlockDevice(PB_5, PB_4, PB_3, PF_3);
 
 // Globals
 bool loggingEnabled = false;		// Switched by user-input command to enable/disable logging
@@ -89,11 +89,11 @@ unsigned short sampleRate = 1000;	// Default sample rate of 1000ms
 EventQueue serialQueue;				// For queueing messages to the serial terminal
 Semaphore semDateChanging;			// Semaphore released to trigger date changing
 
-// Threads
+// Threads (Requirement 6)
 Thread tSample, tSDWrite, tSerialComm, tNetComm, tDatetime, tDatetimeChange, tInput;
 osThreadId_t tDatetimeChangeId, tSDWriteId;
 
-// Classes & Structs //
+/* Classes & Structs */
 
 // SensorData struct: encapsulates data gathered by the board's environmental sensors (via sampleEnvironment())
 struct SensorData
@@ -109,8 +109,11 @@ struct SensorData
         pressure = pres;
         lightLevel = light;
     }
-
-    // Formats struct data. Returns char pointer, which is later freed by the calling scope
+    
+    /** Formats struct data.
+        @return Char array pointer with data.
+        @note Returned pointer must later be freed.        
+    */
     char* getData()
     {
         char* data = (char*) malloc(53 * sizeof(char));
@@ -132,8 +135,11 @@ struct Datetime
     unsigned short changePart = 0; // Part of datetime being modified by user
                                    // [0: wait, 1: day, 2: month, 3: year, 4: hour, 5: // minute, 6: second]. 
                                    //   - Not enum because can't ++dtPart etc. if enum (makes code clunky and gross)
-
-    // Formats struct data. Returns char pointer, which is later freed by the calling scope
+    
+    /** Formats struct data into legible timestamp
+        @return Char array pointer with timestamp.
+        @note Returned pointer must later be freed.        
+    */
     char* getTimestamp()
     {
         char* timestamp = (char*) malloc(19 * sizeof(char));
@@ -141,15 +147,21 @@ struct Datetime
         return timestamp;
     }
 
-    // Formats struct data sans the seconds. Returns timestamp fit for LCD display.
+    
+    /** Formats struct data into legible timestamp sans the seconds
+        @return Char array pointer with timestamp fit for LCD display.
+        @note Returned pointer must later be freed.        
+    */
     char* getTimestampLCD()
     {
         char* timestamp = (char*) malloc(16 * sizeof(char));
         sprintf(timestamp, "%04d-%02d-%02d %02d:%02d", this->year, this->month, this->day, this->hour, this->minute); // Removes seconds as (a) they are not set by the user; (b) they trail off the display and it looks ugly
         return timestamp;
     }
-
-    // Increments the time. Called every 1s
+    
+    /** Increments the time
+        @note Called every 1 second
+    */
     void timeInc()
     {
         if(this->second == 59)
@@ -189,11 +201,12 @@ struct Datetime
 };
 Datetime dateTime;
 
-// FIFOBuffer class: contains own struct and member functions/properties required to buffer data to stagger SD writes
+/** FIFOBuffer class is used to buffer data to stagger SD writes across program lifetime        
+*/
 class FIFOBuffer
-{
-
-    // BufferData struct: encapsulates data which will be stored in the buffer to stagger SD writes
+{    
+    /** BufferData struct: encapsulates data which will be stored in the buffer to stagger SD writes
+    */
     struct BufferData
     {
         Datetime dateTime;
@@ -205,8 +218,10 @@ class FIFOBuffer
             dateTime = time;
             sensorData = data;
         }
-
-        // Formats struct data (and sub-data) into a string. Returns formatted string. Called by readBuffer()
+        
+        /** Formats struct data into legible string
+            @return String of concatenated struct data
+        */
         string getData()
         {
             string data;
@@ -227,6 +242,9 @@ class FIFOBuffer
         Mutex bufferLock;                                      // Lock to prevent producer and consumer functions from manipulating buffer at the same time
 
     public:    
+        /** Safely produces data into the buffer
+            @param sensorData Sensor data object
+        */
         void produce(SensorData sensorData)
         {
             // If there isn't enough space
@@ -248,26 +266,29 @@ class FIFOBuffer
 
                 // Also, call to consume if threshold reached
                 if(itemCount >= consumeThreshold)
-                {                    
+                {                 
                     consume();
                 }
             }
         }
-
-        // Consume the entire buffer (used for writing blocks to the SD card)
+        
+        /** Consume the entire buffer (used for writing blocks to the SD card)            
+        */
         void consume()
         {        
             //REPORT: printf("CONSUMING...\n"); 
-
-            /* START Requirement 2 - SD Card Writing */
+                    printf("CONSUME\n");   
 
             // Release sempahore for the tSDWrite thread.
             semWrite.release();
-
-            /* END Requirement 2 - SD Card Writing */
         }
-        
-        // Reads buffer data according from specified <start> to <end>. Will flush (clear) the buffer if <flush> set to true. Returns string of concatenated buffer data
+                
+        /** Reads buffer data according from specified <start> to <end>.
+            @param end Index of where in the buffer to stop reading
+            @param start Index of where in the buffer to start reading
+            @param flush Whether to flush buffer
+            @note Will flush (clear) the buffer if <flush> set to true. Returns string of concatenated buffer data
+        */
         string readBuffer(int end, int start, bool flush)
         {            
             //REPORT: printf("Locking buffer...\n");
@@ -312,14 +333,17 @@ class FIFOBuffer
             //REPORT: printf("<%d>\n", i);
             return buffer_string;
         }
-
-        // Returns the most recent record/sample in the buffer.
+        
+        /** Returns the most recent record/sample in the buffer.            
+            @return Most recent record/sample
+        */
         string readLastRecord()
         {
             return readBuffer(itemCount, itemCount-1, false); // Read from penultimate record until the ultimate record
         }
-
-		// Locks the mutex to induce a critical timeout error (for demonstration purposes)
+		
+        /** Locks the mutex to induce a critical timeout error (for demonstration purposes)           
+        */
 		void errorTest()
 		{
 			bool locked = bufferLock.trylock_for(5000ms);
@@ -329,14 +353,103 @@ class FIFOBuffer
 };
 FIFOBuffer fifoBuffer;
 
-// ISR called by tDatetimeChange to cycle through parts to change
+
+/** Read sensor data and produce sample on the buffer
+    @note Semaphore self-releases but will be hogged upon user command to put thread into waiting state and disable sampling.
+    @note Runs on own thread tSample every <sampleRate> milliseconds.
+*/
+void sampleEnvironment()
+{
+    while(true)
+    {        
+        // Wait for sample semaphore (1 available by default; stolen by STATE OFF command)
+        semSample.acquire();
+
+            // Collect sample data
+            SensorData sensorData = SensorData(bmp280.getTemperature(), bmp280.getPressure(), ldr);
+            logMessage("Sampled data.\n", false);
+            
+            fifoBuffer.produce(sensorData);
+
+        semSample.release();
+        wait_us(sampleRate*1000);
+    }
+}
+
+/** Writes buffer to SD card in blocks (after successful mount).
+    @note  Will unmount and terminate when flag is set after user command or button press.
+    @note Runs on own thread tSDWrite.
+*/
+void sdWrite() 
+{
+	while(true)
+	{
+		SDBlockDevice sdBlockDevice(PB_5, PB_4, PB_3, PF_3); // Re-initialise
+		
+		tSDWriteId = ThisThread::get_id();
+		ThisThread::flags_clear(1 | 2); // Clear flags
+
+		// Mount the SD card
+		if(sdBlockDevice.init() != 0) 
+		{
+			// PLEASE NOTE: This will sporadically fail for no apparent reason. I suspect hardware fault (as supplied SD card also did not work properly).
+			// If this happens, try running the program again and it should work.
+			logMessage("[ERROR] SD mount failed.\n", true);
+		}
+		else
+		{
+			logMessage("SD mounted.\n", false);
+			greenLED = 1;
+		}
+
+		// Open the file
+		FATFileSystem fs("sd", &sdBlockDevice);
+		FILE* fp = fopen("/sd/data.txt", "a");    
+		if(fp == NULL) 
+		{
+			logMessage("[ERROR] File cannot be opened.\n", true);
+			sdBlockDevice.deinit();
+		}    
+
+		// Runs until flag is sent to unmount the card
+		while (ThisThread::flags_get() == 0) 
+		{
+			semWrite.acquire(); // Puts into waiting state until semaphore released by another process                
+			//REPORT: printf("Writing to card...");        
+			string buffer_contents = fifoBuffer.readBuffer(-1, 0, true);        
+			//REPORT: printf("%s", buffer_contents.c_str());
+			fprintf(fp, "%s", buffer_contents.c_str());
+			logMessage("Wrote data block to SD card.\n", false); 
+			greenLED = 1;
+		}
+
+		// Close file, unmount card, echo confirmation (spec didn't say "log it")
+		fclose(fp);
+		sdBlockDevice.deinit();
+		greenLED = 0;
+		serialQueue.call(serialMessage, "SD CARD: UNMOUNTED\n");
+
+		// While it's unmounted, put in waiting state until re-mounted
+		osSignalWait(2, 10000000);
+		osSignalClear(tSDWriteId, 2);	
+	}	
+	return;
+}
+
+/** ISR to cycle global Datetime object's changePart variable
+    @note Also signals tDatetimeChange thread to unblock.
+    @note Called on rising edge from button A.
+*/
 void changePart() 
 {    
     if (dateTime.changePart != 5) osSignalSet(tDatetimeChangeId, 1); // Signal tDatetimeChange thread to start letting the user change the date/time (if not done being set)
     dateTime.changePart = (dateTime.changePart < 5) ? dateTime.changePart + 1 : 0; // Cycle through parts to change. If it's already 5, then set to 0
 }
 
-// Runs on own thread to update LCD display with current date and time every 1000ms (in synch with timeInc())
+/** Write current date and time from Datetime object to LCD display
+    @note Waits every 1s in synch with the natural rhythm of time.
+    @note Runs on own thread tDatetime.
+*/
 void displayDatetime()
 {    
     while(true)
@@ -363,7 +476,89 @@ void displayDatetime()
     }    
 }
 
-// Runs on own thread to permanently respond to user commands. Waits until user inputs commands and hits ENTER before reacting
+/** Handles user board inputs to change the date and time (via Datetime object)
+    @note Waits for button press signal. Changes are visually updated by thread tDatetime.
+    @note Runs on own thread tDatetimeChange.
+*/
+void handleDatetimeChange()
+{
+    /* START Requirement 4 - Set Date/Time */    
+
+    tDatetimeChangeId = ThisThread::get_id(); // Acquire ID for signalling 
+    btnA.rise(&changePart);
+    while(true)
+    {
+        //REPORT: printf("Changing part %d...\n", dateTime.changePart);
+        osSignalWait(1, 10000000); // 10,000 seconds I shall wait until called upon by -R-o-h-a-n- the changePart() ISR
+        
+        if(dateTime.changePart == 1) // YEAR
+        {
+            float pot_val = potentiometer.read(); // Read potentiometer rotation (1.0 == all the way clockwise, 0.0 == all the way counter-clockwise)
+            int direction = 0; // 0 == stable
+            if(pot_val > 0.66)
+                direction = 1;
+            else if(pot_val < 0.33)
+                direction = -1;
+
+            if(direction != 0) dateTime.year += direction;
+            wait_us(1000000); // Wait 1s between reads to stop the year from zooming past the Heat Death of the Universe
+        } 
+        else if(dateTime.changePart == 2) // MONTH
+        {
+            float pot_val = potentiometer.read();       // Read potentiometer rotation
+
+            dateTime.month = 12 * pot_val;              // Multiplication of maximum value used to set value
+            if(dateTime.month == 0) dateTime.month = 1; // Minimum allowed month
+        } 
+        else if(dateTime.changePart == 3) // DAY
+        {
+            float pot_val = potentiometer.read(); 
+
+            // Maximum value will depend on the currently-set month
+            if(dateTime.month == 4 || dateTime.month == 6 || dateTime.month == 9 || dateTime.month == 11)
+                dateTime.day = 30 * pot_val;
+            else if(dateTime.month == 2)                // February: the ultimate edge case.
+                dateTime.day = 28 * pot_val;
+            else
+                dateTime.day = 31 * pot_val;
+
+            if(dateTime.day == 0) dateTime.day = 1;     // Minimum allowed day
+        } 
+        else if(dateTime.changePart == 4) // HOUR
+        {
+            float pot_val = potentiometer.read();
+            dateTime.hour = 23 * pot_val;               // Between 00:00 and 23:00, so slightly different than other percentile calculations
+        } 
+        else if(dateTime.changePart == 5) // MINUTE
+        {
+            float pot_val = potentiometer.read();
+            dateTime.minute = 59 * pot_val;
+        }
+    }
+
+    /* END Requirement 4 - Set Date/Time */
+}
+
+/** Continuously dispatches serial EventQueue
+    @note Runs on own thread tSerialComm.
+*/
+void serialThread()
+{
+    serialQueue.dispatch_forever();
+}
+
+/** Prints messages through the serial interface.
+    @param message The message to be printed.
+*/
+void serialMessage(string message)
+{
+    printf("%s", message.c_str());
+}
+
+/** Continuously responds to user commands through program lifetime.
+    @note Waits until user inputs a command before reacting.
+    @note Runs on own thread tInput.
+*/
 void getUserInput()
 {
     while(true)
@@ -431,10 +626,12 @@ void getUserInput()
 				*/
 				
 				unsigned short newThreshold;
-				if(t > 1)
+				if(t > 1.0f)
+                {
                     newThreshold = CONSUME_MAX_SECONDS/t; // Flush buffer once a minute (e.g. 2s = 60/2 = 30 records before a MINUTE passes; 30s = 60/30 = 2 records
-
-                fifoBuffer.consumeThreshold = newThreshold;
+                    fifoBuffer.consumeThreshold = newThreshold;
+                }                   
+                
                     
                 // Set the sampling period to <t> seconds (<ms> millseconds), print string to console
                 sampleRate = t*1000;
@@ -444,7 +641,7 @@ void getUserInput()
             else
             {
                 // Out of range error
-                logMessage("[ERROR] SETT variable out of range.\n", false);
+                serialQueue.call(serialMessage, "[ERROR] SETT variable out of range.\n");
             }
         }
         else if(command == "STATE")
@@ -467,7 +664,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] STATE variable must be ON or OFF.\n", false);
+                serialQueue.call(serialMessage, "[ERROR] STATE variable must be ON or OFF.\n");
             }
         }
         else if(command == "LOGGING")
@@ -491,7 +688,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] LOGGING variable must be ON or OFF.\n", false);
+                serialQueue.call(serialMessage, "[ERROR] LOGGING variable must be ON or OFF.\n");
             }
         }
         else if(command == "SD")
@@ -499,7 +696,7 @@ void getUserInput()
             if(variable == "E")
             {
                 // Flush AND eject the SD card (unmount)                
-				sdFlushEject();
+				sdMountToggle();
 
                 // Echo confirmation string
                 serialQueue.call(serialMessage, "SD CARD: FLUSHED, EJECTED\n");
@@ -514,7 +711,7 @@ void getUserInput()
             }
             else
             {
-                logMessage("[ERROR] SD variable must be E or F.\n", false);
+                serialQueue.call(serialMessage, "[ERROR] SD variable must be E or F.\n");
             }
         }
 		else if("ERRORTEST")
@@ -528,187 +725,9 @@ void getUserInput()
     }
 }
 
-// Runs on own thread. Waits for button press signal to allow user to change part of the date/time (displayed on the LCD display)
-void handleDatetimeChange()
-{
-    /* START Requirement 4 - Set Date/Time */    
-
-    tDatetimeChangeId = ThisThread::get_id(); // Acquire ID for signalling 
-    btnA.rise(&changePart);
-    while(true)
-    {
-        //REPORT: printf("Changing part %d...\n", dateTime.changePart);
-        osSignalWait(1, 10000000); // 10,000 seconds I shall wait until called upon by -R-o-h-a-n- the changePart() ISR
-        
-        if(dateTime.changePart == 1) // YEAR
-        {
-            float pot_val = potentiometer.read(); // Read potentiometer rotation (1.0 == all the way clockwise, 0.0 == all the way counter-clockwise)
-            int direction = 0; // 0 == stable
-            if(pot_val > 0.66)
-                direction = 1;
-            else if(pot_val < 0.33)
-                direction = -1;
-
-            if(direction != 0) dateTime.year += direction;
-            wait_us(1000000); // Wait 1s between reads to stop the year from zooming past the Heat Death of the Universe
-        } 
-        else if(dateTime.changePart == 2) // MONTH
-        {
-            float pot_val = potentiometer.read();       // Read potentiometer rotation
-
-            dateTime.month = 12 * pot_val;              // Multiplication of maximum value used to set value
-            if(dateTime.month == 0) dateTime.month = 1; // Minimum allowed month
-        } 
-        else if(dateTime.changePart == 3) // DAY
-        {
-            float pot_val = potentiometer.read(); 
-
-            // Maximum value will depend on the currently-set month
-            if(dateTime.month == 4 || dateTime.month == 6 || dateTime.month == 9 || dateTime.month == 11)
-                dateTime.day = 30 * pot_val;
-            else if(dateTime.month == 2)                // February: the ultimate edge case.
-                dateTime.day = 28 * pot_val;
-            else
-                dateTime.day = 31 * pot_val;
-
-            if(dateTime.day == 0) dateTime.day = 1;     // Minimum allowed day
-        } 
-        else if(dateTime.changePart == 4) // HOUR
-        {
-            float pot_val = potentiometer.read();
-            dateTime.hour = 23 * pot_val;               // Between 00:00 and 23:00, so slightly different than other percentile calculations
-        } 
-        else if(dateTime.changePart == 5) // MINUTE
-        {
-            float pot_val = potentiometer.read();
-            dateTime.minute = 59 * pot_val;
-        }
-    }
-
-    /* END Requirement 4 - Set Date/Time */
-}
-
-// Runs on own thread, waiting for semaphore release signal to write to SD card in blocks. Will unmount and terminate when flag is set after user command.
-void sdWrite() 
-{
-	while(true)
-	{
-		SDBlockDevice sdBlockDevice(PB_5, PB_4, PB_3, PF_3); // Re-initialise
-		
-		tSDWriteId = ThisThread::get_id();
-		ThisThread::flags_clear(1 | 2); // Clear flags
-
-		// Mount the SD card
-		if(sdBlockDevice.init() != 0) 
-		{
-			// PLEASE NOTE: This will sporadically fail for no apparent reason. I suspect hardware fault (as supplied SD card also did not work properly).
-			// If this happens, try running the program again and it should work.
-			logMessage("[ERROR] SD mount failed.\n", true);
-		}
-		else
-		{
-			logMessage("SD mounted.\n", false);
-			greenLED = 1;
-		}
-
-		// Open the file
-		FATFileSystem fs("sd", &sdBlockDevice);
-		FILE* fp = fopen("/sd/data.txt", "a");    
-		if(fp == NULL) 
-		{
-			logMessage("[ERROR] File cannot be opened.\n", true);
-			sdBlockDevice.deinit();
-		}    
-
-		// Runs until flag is sent to unmount the card
-		while (ThisThread::flags_get() == 0) 
-		{
-			semWrite.acquire(); // Puts into waiting state until semaphore released by another process                
-			//REPORT: printf("Writing to card...");        
-			string buffer_contents = fifoBuffer.readBuffer(-1, 0, true);        
-			//REPORT: printf("%s", buffer_contents.c_str());
-			fprintf(fp, "%s", buffer_contents.c_str());
-			logMessage("Wrote data block to SD card.\n", false); 
-			greenLED = 1;
-		}
-
-		// Close file, unmount card, echo confirmation (spec didn't say "log it")
-		fclose(fp);
-		sdBlockDevice.deinit();
-		greenLED = 0;
-		serialQueue.call(serialMessage, "SD CARD: UNMOUNTED\n");
-
-		// While it's unmounted, put in waiting state until re-mounted
-		osSignalWait(2, 10000000);
-		osSignalClear(tSDWriteId, 2);	
-	}	
-	return;
-}
-
-void sdFlushEject()
-{	
-	if(greenLED == 0) // If unmounted, mount
-	{		
-		osSignalSet(tSDWriteId, 2);		
-		semWrite.release(); // Immediately write to SD card
-   		greenLED = 1;
-	}
-	else // If mounted, unmount
-	{
-		semWrite.release();     // SD write function will flush buffer
-		tSDWrite.flags_set(1);  // Flag will end write check loop and eject SD card
-	}
-	wait_us(200000); // Wait 0.2s to prevent accidental double-tapping of button
-}
-
-// Runs on own thread every <sampleRate> milliseconds. 
-// Semaphore self-releases but will be hogged upon user command to put thread into waiting state and disable sampling.
-void sampleEnvironment()
-{
-    while(true)
-    {        
-        // Wait for sample semaphore (1 available by default; stolen by STATE OFF command)
-        semSample.acquire();
-
-            // Collect sample data
-            SensorData sensorData = SensorData(bmp280.getTemperature(), bmp280.getPressure(), ldr);
-            logMessage("Sampled data.\n", false);
-            
-            fifoBuffer.produce(sensorData);
-
-        semSample.release();
-        wait_us(sampleRate*1000);
-    }
-}
-
-// Runs on own thread, constantly dispatching events as they come
-void serialThread()
-{
-    serialQueue.dispatch_forever();
-}
-
-// Prints <message> through the serial interface
-void serialMessage(string message)
-{
-    printf("%s", message.c_str());
-}
-
-// Formats <message> as a logged message before sending to serialQueue. Triggers error if <isCriticalError> is true.
-void logMessage(string message, bool isCriticalError)
-{
-    if(isCriticalError)
-    {
-        redLED = 1;
-        error("%s", message.c_str());
-    } 
-    else if(loggingEnabled)
-    {
-        message = "[LOG] " + message;
-        serialQueue.call(serialMessage, message);
-    }       
-}
-
-// Initialises an onboard web page server and displays data upon user refresh
+/** Initialises onboard web page server and displays data upon user refresh
+    @note Runs on own thread tNetComm.
+*/
 void refreshServer()
 {    
 	// Initialise ethernet connection
@@ -788,11 +807,50 @@ void refreshServer()
     }
 }
 
-// The main thread
+/** Formats messages as logged messages before sending to serialQueue.
+    @param message The message to be logged.
+    @param isCriticalError Whether the message is a critical error
+    @note Triggers critical error if isCriticalError is true
+*/
+void logMessage(string message, bool isCriticalError)
+{
+    if(isCriticalError)
+    {
+        redLED = 1;
+        error("%s", message.c_str());
+    } 
+    else if(loggingEnabled)
+    {
+        message = "[LOG] " + message;
+        serialQueue.call(serialMessage, message);
+    }       
+}
+
+/** Toggles mounting of SD card.
+    @note Relies on greenLED to determine current mount status.
+    @note Will also flush SD card.
+*/
+void sdMountToggle()
+{	
+	if(greenLED == 0) // If unmounted, mount
+	{		
+		osSignalSet(tSDWriteId, 2);		
+		semWrite.release(); // Immediately write to SD card
+   		greenLED = 1;
+	}
+	else // If mounted, unmount
+	{
+		semWrite.release();     // SD write function will flush buffer
+		tSDWrite.flags_set(1);  // Flag will end write check loop and eject SD card
+	}
+	wait_us(200000); // Wait 0.2s to prevent accidental double-tapping of button
+}
+
+
+/** The main thread
+*/
 int main()
 {
-    /* START REQUIREMENT 1 - Environmental Sensor */
-
     // Reset LEDs
     redLED = 0;
     greenLED = 0;
@@ -801,13 +859,13 @@ int main()
     bmp280.initialize();
     
     // Start threads
-    tSerialComm.start(serialThread);    
-    tSample.start(sampleEnvironment);
-    tDatetime.start(displayDatetime);
-    tDatetimeChange.start(handleDatetimeChange);
-    tSDWrite.start(sdWrite);
-    tNetComm.start(refreshServer);
-    tInput.start(getUserInput); 
+    tSerialComm.start(serialThread);              // Requirement 6  
+    tSample.start(sampleEnvironment);             // Requirement 1
+    tDatetime.start(displayDatetime);             // Requirement 4
+    tDatetimeChange.start(handleDatetimeChange);  // Requirement 4
+    tSDWrite.start(sdWrite);                      // Requirement 2 & 3
+    tNetComm.start(refreshServer);                // Requirement 9
+    tInput.start(getUserInput);                   // Requirement 8
 
-    btnUser.rise(&sdFlushEject);
+    btnUser.rise(&sdMountToggle);                 // Requirement 13
 }
